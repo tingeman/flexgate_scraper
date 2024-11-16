@@ -1,0 +1,35 @@
+flexgate_browse_url: "https://flexgate.org/fg2lite/sw/browse.php"
+
+base_download_folder: "downloads"
+
+downloadable_extensions:
+  - ".f2p"
+  - ".f2b"
+  - ".txt"
+  - ".dat"
+  - ".par"
+
+sources:
+  - serial: "D1022C"
+    logger_name: "GIOS2023-02"
+    folders: 
+      - raw
+      - par
+    files: 
+      - "con_log.txt"
+      - "log.txt"
+      - "loggerinfo.dat"
+      - "service.dat"
+      - "state.dat"
+
+  - serial: "D1022F"
+    logger_name: "SIS2019-01"
+    folders:
+      - raw
+      - par
+    files: 
+      - "con_log.txt"
+      - "log.txt"
+      - "loggerinfo.dat"
+      - "service.dat"
+      - "state.dat"
