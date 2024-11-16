@@ -1,0 +1,20 @@
+services:
+  flexgate_scraper:
+    container_name: flexgate_scraper
+    build:
+      context: .
+    volumes:
+      - ./config/cron_jobs:/app/cron_jobs
+      - ./config/settings.yml:/app/settings.yml
+      - flexgate_data:/app/downloads  # Use Docker volume for downloaded files
+    environment:
+      - TZ=UTC
+    restart: unless-stopped
+    command: >
+      sh -c 'basename /path/to/file'
+
+volumes:
+  flexgate_data:
+
+
+# docker exec -it flexgate_scraper /bin/bash
