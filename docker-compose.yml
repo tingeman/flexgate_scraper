@@ -10,8 +10,6 @@ services:
     environment:
       - TZ=UTC
     restart: unless-stopped
-    command: >
-      sh -c 'basename /path/to/file'
 
 volumes:
   flexgate_data:
