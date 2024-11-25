@@ -38,8 +38,15 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
+
+# Get the directory of the current script
+script_dir = Path(__file__).parent
+
+# Construct the path to the settings.yml file
+settings_path = script_dir / "settings.yml"
+
 # Load settings from YAML file
-with open("settings.yml", "r") as file:
+with open(settings_path, "r") as file:
     yaml_settings = yaml.safe_load(file)
 
 # Merge YAML settings with Pydantic Settings
