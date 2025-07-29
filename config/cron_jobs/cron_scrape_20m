@@ -2,7 +2,7 @@
 ##  (-) Characters to escape: %, $
 ## 
 ##  Min  Hour Day  Mon  Weekday
-##  *    *    *    *    *  command to be executed
+##  *    *    *    *    *    [user]   [command to be executed]
 ##  ┬    ┬    ┬    ┬    ┬
 ##  │    │    │    │    └─  Weekday  (0=Sun .. 6=Sat)
 ##  │    │    │    └──────  Month    (1..12)
@@ -13,4 +13,11 @@
 ##--------------------------------------------------------------------------------------------------
 
 # Run the scraper hourly, 20 min past the hour
-20 * * * * /usr/local/bin/python /app/flexgate_scraper.py >> /var/log/cron.log 2>&1
+20 * * * * root /usr/local/bin/python /app/flexgate_scraper.py >> /var/log/cron.log 2>&1
+
+# cron.d scripts must specify the user to run the command
+# cron.d scripts must have a blank line (or comment) at the end
+# cron.d scripts must not contain . or - in the filename (no extension!)
+# cron.d scripts must be placed in /etc/cron.d/
+# cron.d scripts must be owned by root and have permissions 644 (rw-r--r--)
+# cron.d scripts do not have access to environment variables set by docker compose
