@@ -1,7 +1,15 @@
+# Template for settings.yml file
+# Should be overridden with actual values
+
+# URL for the Flexgate server
 flexgate_browse_url: "https://flexgate.org/fg2lite/sw/browse.php"
 
+# Downloaded files will be placed here
 base_download_folder: "downloads"
 
+# List of file extensions that are considered downloadable
+# Only files in the specified source folders that match these extensions will be downloaded
+# Specific source files listed in the sources::files section will always be downloaded regardless of their extension
 downloadable_extensions:
   - ".f2p"
   - ".f2b"
@@ -9,6 +17,9 @@ downloadable_extensions:
   - ".dat"
   - ".par"
 
+# List of sources to scrape
+# Each source must have a unique serial number used to identify it in the flexgate system
+# Downloaded files will be placed in the folder ./{base_download_folder}/{serial}_{logger_name}/
 sources:
   - serial: "D1022C"
     logger_name: "GIOS2023-02"
