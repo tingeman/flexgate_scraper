@@ -160,3 +160,7 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Vendor binaries (e.g. the GeoPrecision decoder) are never committed: they are obtained
+# from the manufacturer and added to the image at build time. See README.md.
+bin/
