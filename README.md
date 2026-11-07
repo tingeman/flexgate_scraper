@@ -5,7 +5,8 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 ## Features
 
 - Scrapes multiple sources from Flexgate using configurable serial numbers and logger names.
-- Downloads files with specific extensions or explicitly listed filenames.
+- Downloads new files with specific extensions from the logger folders, and keeps explicitly
+  listed top-level files (`files`) up to date (replaced when their content changes).
 - Organizes downloads by source in a structured folder hierarchy.
 - Optionally decodes downloaded GeoPrecision data files (`.f2b`) to CSV files, with
   GeoPrecision's decoder program (not included; see
@@ -244,6 +245,16 @@ docker compose up --build
   all sources afterwards. "All files downloaded successfully." is logged only when no source
   failed; otherwise a WARNING lists the failed sources. The run ends with a summary line
   (`Run finished: <n> source(s) ok, <m> failed, <k> file(s) downloaded.`).
+- **What is downloaded**: files in the source's `folders` that have one of the
+  `downloadable_extensions` are downloaded once: a file that is already in the local folder
+  is not fetched again. The top-level files listed in `files` (e.g. `log.txt`, `state.dat`)
+  are updated by FlexGate, so each one found in the logger's listing is fetched on every
+  run. It is written only when it is new or its content differs from the local copy
+  (through `.<name>.part` and a rename, as below; logged as `Updated <path>`); an unchanged
+  file is not written at all, so its modification time stays. A failed refresh (network
+  error, timeout, HTTP error, file system error) keeps the old file as it was and counts as
+  a failed source. `<k> file(s) downloaded` and `files_downloaded` count only files that
+  were written (new or replaced).
 - **Partial downloads**: a file is written as `.<name>.part` in its folder and renamed to
   its final name only when it is complete, so a file with its final name is always whole.
   Files get mode 0644 whatever the umask. Leftover `.part` files from an interrupted run
@@ -273,7 +284,7 @@ logged as an ERROR and does not change the exit code. Fields:
 | `ok` | `true` only if no source failed, no file failed to decode, the decode step could run and no unexpected error happened |
 | `sources_ok` | number of sources processed without error |
 | `sources_failed` | list of the failed sources' folder names (`<serial>_<logger_name>` or `<serial>`) |
-| `files_downloaded` | files downloaded in this run |
+| `files_downloaded` | files written in this run: new files, and top-level files replaced because their content changed |
 | `files_decoded`, `decode_failed` | data files decoded / failed in this run (`0` without decoding); a logger whose decoding raised unexpectedly counts as one failure |
 | `decode_error` | why the decode step could not run at all (e.g. a missing decoder), else `null` |
 | `error` | an unexpected error that ended the run (`<type>: <message>`), else `null` |
@@ -399,8 +410,11 @@ syntax), the entrypoint (cron jobs installed with mode 0644, refusal to start wi
 settings) and the scraper itself: it is run against a local fake FlexGate server
 (`tests/fake_flexgate.py`) on a private `--internal` docker network, and the tests check
 where files land, that a second run downloads nothing and that a new file on the server is
-picked up. Run robustness is tested with the fake server's control files (`.fake_status`
-answers a listing with an HTTP error, `.fake_delay` stalls it; see `tests/fake_flexgate.py`):
+picked up, and that the top-level `files` are fetched every run but replaced only when their
+content changed (an unchanged file keeps its modification time, a failed refresh keeps the
+old file). Run robustness is tested with the fake server's control files (`.fake_status`
+answers a listing with an HTTP error, `.fake_file_status` the files of a directory,
+`.fake_delay` stalls a listing; see `tests/fake_flexgate.py`):
 a failing or stalled logger does not stop the next one and gives exit code 1, leftover
 `.part` files are removed and downloaded again, downloaded files have mode 0644, and a run
 started while the lock is held exits 0 without downloading. The status tests check the

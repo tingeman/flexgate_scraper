@@ -148,26 +148,52 @@ def remove_partial_downloads(folder: Path):
             p.unlink()
 
 
-# Function to download a file: written to .<name>.part in the same folder, renamed to its
-# final name once complete
-def download_file(file_url: str, output_path: Path, timeout: tuple):
-    logging.info(f"Downloading {file_url}...")
+def fetch(file_url: str, timeout: tuple) -> bytes:
+    """Content of file_url; network and HTTP errors are raised."""
     response = requests.get(file_url, timeout=timeout)
     response.raise_for_status()
+    return response.content
 
-    # Save the file
+
+def write_file(content: bytes, output_path: Path):
+    """Write content to .<name>.part in the same folder (mode 0644), then rename it to
+    output_path. On any error the .part file is removed and an existing output_path is left
+    as it was."""
     tmp = part_path(output_path)
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
         with os.fdopen(fd, "wb") as f:
             os.fchmod(f.fileno(), FILE_MODE)  # independent of the umask
-            f.write(response.content)
+            f.write(content)
         os.replace(tmp, output_path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
 
+
+# Download a file that is not there yet (written through .<name>.part, see write_file)
+def download_file(file_url: str, output_path: Path, timeout: tuple):
+    logging.info(f"Downloading {file_url}...")
+    write_file(fetch(file_url, timeout), output_path)
     logging.info(f"Saved to {output_path}")
+
+
+def refresh_file(file_url: str, output_path: Path, timeout: tuple) -> bool:
+    """Fetch a file that FlexGate updates (the top-level files of a source) and replace the
+    local copy only when the content differs; an unchanged file is not written at all (its
+    mtime stays). Returns True when the file was written. On errors the old file is kept and
+    the error is raised."""
+    if not output_path.exists():
+        download_file(file_url, output_path, timeout)
+        return True
+    logging.debug(f"Refreshing {file_url}")
+    content = fetch(file_url, timeout)
+    if output_path.read_bytes() == content:
+        logging.debug(f"{output_path} unchanged")
+        return False
+    write_file(content, output_path)
+    logging.info(f"Updated {output_path}")
+    return True
 
 
 # Function to get page content and parse links
@@ -193,8 +219,8 @@ def get_base_url(browse_url: str) -> str:
 
 
 def scrape_source(source: Source, base_url: str, timeout: tuple) -> int:
-    """Download what is new for one source and return the number of files downloaded.
-    Network, HTTP and file system errors are raised to the caller."""
+    """Download what is new for one source (new folder files, new or changed top-level
+    files) and return the number of files written. Network, HTTP and file system errors are raised to the caller."""
     downloaded = 0
     serial = source.serial
     logger_name = source.logger_name or ""
@@ -215,23 +241,20 @@ def scrape_source(source: Source, base_url: str, timeout: tuple) -> int:
         # Get links from the serial page
         links = get_links_from_page(logger_url, timeout)
 
-        # Download each specific file if found
+        # Fetch each specific file found on every run (FlexGate updates them); written only
+        # when new or changed
         for link in links:
             href = link.get("href")
             if href:
                 file_name = Path(urlparse(href).path).name  # Extract only the filename
                 if file_name in specific_files:
                     file_path = serial_output_folder / file_name
-                    if file_path.exists():
-                        logging.debug(f"Skipping {file_name}, already downloaded.")
-                        continue
-
                     # combine baseurl wiht href
                     file_url = urljoin(base_url, href)
-                    download_file(str(file_url), file_path, timeout)
-                    downloaded += 1
+                    if refresh_file(str(file_url), file_path, timeout):
+                        downloaded += 1
 
-    # Download files from specified folders
+    # Download files from specified folders (once: a file already here is not fetched again)
     for folder in folders:
         # Create URL to get the contentlisting of the folder
         parsed_url = urlparse(settings.flexgate_browse_url)

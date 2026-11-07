@@ -768,8 +768,9 @@ t_bad_entry() {
 
 RS=""
 
-# Settings without decoding: rob_cfg <file> <source>...; source is SERIAL or SERIAL:FILE
-# (FILE is downloaded from the serial page as a listed file)
+# Settings without decoding: rob_cfg <file> <source>...; source is SERIAL or
+# SERIAL:FILE[,FILE...] (each FILE is fetched from the serial page as a listed file; written
+# as the comma-separated string form of "files")
 rob_cfg() {
   local f="$1" s
   shift
@@ -781,7 +782,7 @@ rob_cfg() {
     for s in "$@"; do
       echo "  - serial: \"${s%%:*}\""
       echo '    folders: [raw, par]'
-      [ "$s" = "${s%%:*}" ] || echo "    files: [\"${s#*:}\"]"
+      [ "$s" = "${s%%:*}" ] || echo "    files: \"${s#*:}\""
     done
   } > "$f"
 }
@@ -789,7 +790,7 @@ rob_cfg() {
 rob_setup() {
   TESTNAME="robsetup"
   local d="$DL_E/srv/fg2lite/data" s
-  for s in H0008H I0009I J0010J K0011K L0012L M0013M N0014N O0015O; do mkdir -p "$d/$s/raw" "$d/$s/par"; done
+  for s in H0008H I0009I J0010J K0011K L0012L M0013M N0014N O0015O P0016P; do mkdir -p "$d/$s/raw" "$d/$s/par"; done
   # H0008H: every listing answers HTTP 500. I0009I: every listing stalls for 20 s.
   printf 'h\n' > "$d/H0008H/raw/H0008H_001.f2b"
   printf '500\n' > "$d/H0008H/.fake_status"
@@ -808,6 +809,10 @@ rob_setup() {
   printf 'n raw\n' > "$d/N0014N/raw/n1.f2p"
   printf 'NO;TIME\n' > "$d/N0014N/par/N0014N_P1.f2p"
   printf 'o raw\n' > "$d/O0015O/raw/o1.f2p"
+  # P0016P: top-level files that change on the server
+  printf 'p log 1\n' > "$d/P0016P/log.txt"
+  printf 'p state\n' > "$d/P0016P/state.dat"
+  printf 'p raw\n' > "$d/P0016P/raw/p1.f2p"
 
   RS="$DL_E/rob"
   mkdir -p "$RS"
@@ -817,6 +822,7 @@ rob_setup() {
   rob_cfg "$RS/r4.yml" M0013M
   rob_cfg "$RS/r5.yml" N0014N:log.txt
   rob_cfg "$RS/r6.yml" O0015O
+  rob_cfg "$RS/r7.yml" P0016P:log.txt,state.dat
 }
 
 t_rob_http500() {
@@ -875,6 +881,80 @@ t_rob_owner() {
   expect "N0014N entries" "$(vsh 'cd /d && find N0014N -printf "%y %U:%G %m %p\n"' | sorted)" "$(printf '%s\n' \
     'd 30000:30000 755 N0014N' 'f 30000:30000 644 N0014N/log.txt' 'd 30000:30000 755 N0014N/raw' \
     'f 30000:30000 644 N0014N/raw/n1.f2p' 'd 30000:30000 755 N0014N/par' 'f 30000:30000 644 N0014N/par/N0014N_P1.f2p' | sorted)"
+}
+
+# Top-level files (P0016P, files log.txt and state.dat): fetched on every run, written only
+# when the content changed, through .part and a rename; an unchanged file keeps its mtime;
+# a failed refresh keeps the old file and fails the source. The tests run in order.
+P_OLD="2020-01-01 00:00:00"
+# "<mtime> <uid>:<gid> <mode> <name>" of the local top-level files, one line each
+ptop() { vsh 'cd /d/P0016P && stat -c "%Y %u:%g %a %n" log.txt state.dat'; }
+ptop_of() { printf '%s\n' "$1" | grep " $2\$"; }
+# Number of requests the fake server got so far for a top-level file of P0016P
+preq() { docker logs "$PFX-fakefg-srv" 2>&1 | grep -c "^REQ /fg2lite/data/P0016P/$1\$" || true; }
+
+t_top_changed() {
+  [ -n "$RS" ] || fail_t "the robustness setup did not run"
+  local before after
+  dscrape "$RS/r7.yml"
+  [ "$SRC" -eq 0 ] || fail_t "first run: scraper exit code $SRC: $SOUT"
+  expect "first run: number of downloads" "$(n_downloads "$SOUT")" "3"
+  vsh "touch -d '$P_OLD' /d/P0016P/log.txt /d/P0016P/state.dat" || fail_t "could not set the mtimes"
+  before="$(ptop)"
+  printf 'p log 2\n' > "$DL_E/srv/fg2lite/data/P0016P/log.txt"
+  dscrape "$RS/r7.yml" -e SCRAPE_UMASK=077
+  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
+  after="$(ptop)"
+  expect "number of downloads" "$(n_downloads "$SOUT")" "0"
+  contains "log" "$SOUT" "INFO - Updated /app/downloads/P0016P/log.txt"
+  lacks "log" "$SOUT" "Updated /app/downloads/P0016P/state.dat"
+  contains "log" "$SOUT" "Run finished: 1 source(s) ok, 0 failed, 1 file(s) downloaded."
+  contains "status" "$(st_summary)" " files_downloaded=1 "
+  expect "content of log.txt" "$(vsh 'cat /d/P0016P/log.txt')" "p log 2"
+  expect "content of state.dat" "$(vsh 'cat /d/P0016P/state.dat')" "p state"
+  expect "log.txt owner and mode" "$(ptop_of "$after" log.txt | cut -d' ' -f2-)" "30000:30000 644 log.txt"
+  [ "$(ptop_of "$after" log.txt)" != "$(ptop_of "$before" log.txt)" ] || fail_t "log.txt was not rewritten: $after"
+  expect "state.dat (not rewritten)" "$(ptop_of "$after" state.dat)" "$(ptop_of "$before" state.dat)"
+  expect ".part files left" "$(vsh 'find /d/P0016P -name "*.part"')" ""
+}
+
+t_top_unchanged() {
+  [ -n "$RS" ] || fail_t "the robustness setup did not run"
+  local before after req_log req_state
+  vsh "touch -d '$P_OLD' /d/P0016P/log.txt /d/P0016P/state.dat" || fail_t "could not set the mtimes"
+  before="$(ptop)"
+  req_log="$(preq log.txt)"
+  req_state="$(preq state.dat)"
+  dscrape "$RS/r7.yml"
+  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
+  after="$(ptop)"
+  expect "number of downloads" "$(n_downloads "$SOUT")" "0"
+  lacks "log" "$SOUT" "Updated"
+  lacks "log" "$SOUT" "Saved to"
+  contains "log" "$SOUT" "Run finished: 1 source(s) ok, 0 failed, 0 file(s) downloaded."
+  contains "status" "$(st_summary)" " files_downloaded=0 "
+  expect "top-level files (mtime, owner, mode)" "$after" "$before"
+  expect "requests for log.txt" "$(preq log.txt)" "$((req_log + 1))"
+  expect "requests for state.dat" "$(preq state.dat)" "$((req_state + 1))"
+}
+
+t_top_fail() {
+  [ -n "$RS" ] || fail_t "the robustness setup did not run"
+  local d="$DL_E/srv/fg2lite/data/P0016P" before ctl
+  printf 'p log 3\n' > "$d/log.txt"
+  before="$(ptop)"
+  # a file request answered with HTTP 503, then the listing answered with HTTP 500
+  for ctl in .fake_file_status:503 .fake_status:500; do
+    printf '%s\n' "${ctl#*:}" > "$d/${ctl%%:*}"
+    dscrape "$RS/r7.yml"
+    rm -f "$d/${ctl%%:*}"
+    expect "scraper exit code ($ctl)" "$SRC" "1"
+    contains "log ($ctl)" "$SOUT" "ERROR - Source P0016P failed, continuing with the next source: HTTPError: ${ctl#*:}"
+    lacks "log ($ctl)" "$SOUT" "Updated"
+    expect "top-level files ($ctl)" "$(ptop)" "$before"
+    expect "content of log.txt ($ctl)" "$(vsh 'cat /d/P0016P/log.txt')" "p log 2"
+    expect ".part files left ($ctl)" "$(vsh 'find /d/P0016P -name "*.part"')" ""
+  done
 }
 
 # A cron job line in the production form (user field root, the root shell opens
@@ -1022,6 +1102,9 @@ run_test "robust: second run while the lock is held exits 0 with a WARNING" t_ro
 run_test "status: run skipped by the lock leaves the status file alone" t_status_lock
 run_test "status: unwritable status file logs an ERROR, exit code unchanged" t_status_write_fail
 run_test "user: files 30000:30000 0644, folders 0755, also with umask 077" t_rob_owner
+run_test "top-level files: changed content replaces the file (30000 0644), counted as downloaded" t_top_changed
+run_test "top-level files: unchanged content fetched again, file untouched (mtime), 0 downloaded" t_top_unchanged
+run_test "top-level files: failed refresh (file or listing HTTP error) keeps the old file, exit 1" t_top_fail
 run_test "user: cron job (root, as-dockeruser, > /proc/1/fd/1) runs as 30000, output in the container log" t_cron_job
 
 TOTAL=$((PASSED + FAILED))

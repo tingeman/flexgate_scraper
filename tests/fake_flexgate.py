@@ -18,6 +18,8 @@ Test behaviours are set by control files in a directory under <root> (never list
                  directories below it is answered with that status (e.g. 500)
   .fake_delay    contains seconds: the server waits that long before answering the
                  listing of this directory or of the directories below it
+  .fake_file_status  contains an HTTP status code: requests for the files directly in this
+                 directory (not its listing) are answered with that status (e.g. 503)
 
 Only the standard library is used, so it runs in the scraper image. Each request is
 logged to stdout as "REQ <path>".
@@ -32,7 +34,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 ROOT = Path(sys.argv[1]).resolve()
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 SW_DIR = ROOT / "fg2lite" / "sw"
-CONTROL_FILES = (".fake_status", ".fake_delay")
+CONTROL_FILES = (".fake_status", ".fake_delay", ".fake_file_status")
 
 
 def inside_root(path: Path) -> bool:
@@ -76,6 +78,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         target = ROOT / unquote(url.path).lstrip("/")
         if inside_root(target) and target.is_file():
+            file_status = target.parent / ".fake_file_status"
+            if file_status.is_file():
+                status = int(file_status.read_text().strip())
+                self.send(status, f"fake status {status}".encode())
+                return
             self.send(200, target.read_bytes(), "application/octet-stream")
         else:
             self.send(404, b"not found")
