@@ -328,12 +328,14 @@ unhealthy: status file unreadable: ...
   the clock and the container start time.
 
 The example [`docker-compose.yml`](docker-compose.yml) sets it; the Dockerfile has no
-`HEALTHCHECK`, so the compose file that runs the container decides:
+`HEALTHCHECK`, so the compose file that runs the container decides. Docker runs the first
+check one `interval` after the start, so `docker compose up --wait` reports healthy only
+then; keep the interval short (1 minute here; the check only reads the status file):
 
 ```yaml
     healthcheck:
       test: ["CMD", "python", "/app/healthcheck.py", "--max-age-minutes", "130"]
-      interval: 5m
+      interval: 1m
       timeout: 30s
       retries: 1
 ```

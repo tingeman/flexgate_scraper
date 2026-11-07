@@ -12,10 +12,12 @@ services:
     restart: unless-stopped
     # Unhealthy when the last run (hourly at :20, see config/cron_jobs) is older than 130
     # minutes or had a failed source or a decode failure; see README, "Healthcheck".
-    # No start_period: the script itself is healthy for 130 minutes after the start.
+    # No start_period: the script itself is healthy for 130 minutes after the start. Docker
+    # runs the first check one interval after the start, so `docker compose up --wait` sees
+    # "healthy" after about a minute; a longer interval makes --wait wait that long.
     healthcheck:
       test: ["CMD", "python", "/app/healthcheck.py", "--max-age-minutes", "130"]
-      interval: 5m
+      interval: 1m
       timeout: 30s
       retries: 1
 
