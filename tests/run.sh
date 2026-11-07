@@ -346,15 +346,19 @@ dec_setup() {
 
 # One scraper run with the decode volumes; sets SOUT, SRC and DCALLS (the inputs the stub
 # was called with, one per line, in order). Fails if anything is left in /tmp after the run
-# (the decoder work folder must be removed, also after errors).
+# (the decoder work folder must be removed, also after errors; the run lock file stays).
+#   dscrape <settings file> [docker run arguments...]
+# -e SCRAPE_UMASK=<umask> runs the scraper with that umask (default 022).
 dscrape() {
   [ "$DEC_OK" -eq 1 ] || fail_t "the decode test setup failed"
-  local calls="/stub/calls-$TESTNAME-$RANDOM.log"
+  local calls="/stub/calls-$TESTNAME-$RANDOM.log" settings="$1"
+  shift
   SRC=0
   SOUT="$(docker run --rm --network "$NET" --name "$PFX-dec-run-$RANDOM" \
-    -v "$(hp "$1"):/app/settings.yml:ro" -v "$DECVOL:/app/downloads" -v "$STUBVOL:/stub" \
-    -e STUB_DECODE3_CALLS="$calls" -e STUB_DECODE3_KEEP=/stub/keep \
-    --entrypoint sh "$IMAGE" -c 'python /app/flexgate_scraper.py; rc=$?; ls -A /tmp | sed "s/^/TMPLEFT /"; exit $rc' 2>&1)" || SRC=$?
+    -v "$(hp "$settings"):/app/settings.yml:ro" -v "$DECVOL:/app/downloads" -v "$STUBVOL:/stub" \
+    -e STUB_DECODE3_CALLS="$calls" -e STUB_DECODE3_KEEP=/stub/keep "$@" \
+    --entrypoint sh "$IMAGE" -c 'umask "${SCRAPE_UMASK:-022}"; python /app/flexgate_scraper.py; rc=$?
+      ls -A /tmp | grep -vx flexgate_scraper.lock | sed "s/^/TMPLEFT /"; exit $rc' 2>&1)" || SRC=$?
   lacks "work folder left in /tmp" "$SOUT" "TMPLEFT"
   DCALLS="$(vsh "cat $calls 2>/dev/null; true")"
 }
@@ -526,6 +530,136 @@ t_bad_entry() {
   contains "log" "$out" "/app/settings.yml is invalid"
 }
 
+# ---- run robustness ------------------------------------------------------------------
+# Failing and stalling sources, partial downloads, file modes and the run lock. Uses the
+# fake FlexGate server (control files .fake_status/.fake_delay, see fake_flexgate.py) and
+# the decode volumes; new serials only, so earlier folders are not touched.
+
+RS=""
+
+# Settings without decoding: rob_cfg <file> <source>...; source is SERIAL or SERIAL:FILE
+# (FILE is downloaded from the serial page as a listed file)
+rob_cfg() {
+  local f="$1" s
+  shift
+  {
+    echo 'flexgate_browse_url: "http://flexgate:8080/fg2lite/sw/browse.php"'
+    echo 'base_download_folder: "/app/downloads"'
+    echo 'downloadable_extensions: [".f2p", ".f2b"]'
+    echo 'sources:'
+    for s in "$@"; do
+      echo "  - serial: \"${s%%:*}\""
+      echo '    folders: [raw, par]'
+      [ "$s" = "${s%%:*}" ] || echo "    files: [\"${s#*:}\"]"
+    done
+  } > "$f"
+}
+
+rob_setup() {
+  TESTNAME="robsetup"
+  local d="$DL_E/srv/fg2lite/data" s
+  for s in H0008H I0009I J0010J K0011K L0012L M0013M; do mkdir -p "$d/$s/raw" "$d/$s/par"; done
+  # H0008H: every listing answers HTTP 500. I0009I: every listing stalls for 20 s.
+  printf 'h\n' > "$d/H0008H/raw/H0008H_001.f2b"
+  printf '500\n' > "$d/H0008H/.fake_status"
+  printf 'i\n' > "$d/I0009I/raw/I0009I_001.f2b"
+  printf '20\n' > "$d/I0009I/.fake_delay"
+  # J0010J: good logger with a parameter set and a data file (decoded after H0008H fails)
+  printf 'NO;TIME;#1(oC)\n' > "$d/J0010J/par/J0010J_P1.f2p"
+  printf '%s\n' 'PARSET J0010J_P1.f2p' '1;28.10.2026 16:00:10;-1,5' > "$d/J0010J/raw/J0010J_001.f2b"
+  # K0011K: leftover partial downloads; L0012L, M0013M: plain good loggers
+  printf 'k log\n' > "$d/K0011K/log.txt"
+  printf 'k raw\n' > "$d/K0011K/raw/k1.f2p"
+  printf 'l raw\n' > "$d/L0012L/raw/l1.f2p"
+  printf 'm raw\n' > "$d/M0013M/raw/m1.f2p"
+
+  RS="$DL_E/rob"
+  mkdir -p "$RS"
+  dec_cfg "$RS/r1.yml" /stub/decode3 60 % H0008H J0010J
+  rob_cfg "$RS/r2.yml" I0009I L0012L
+  rob_cfg "$RS/r3.yml" K0011K:log.txt
+  rob_cfg "$RS/r4.yml" M0013M
+}
+
+t_rob_http500() {
+  dscrape "$RS/r1.yml"
+  expect "scraper exit code" "$SRC" "1"
+  contains "log" "$SOUT" "ERROR - Source H0008H failed, continuing with the next source: HTTPError: 500"
+  expect "H0008H files" "$(vsh 'find /d/H0008H -type f')" ""
+  expect "J0010J downloads" "$(dlisting J0010J)" "$(printf '%s\n' 'd raw' 'f raw/J0010J_001.f2b' 'd par' \
+    'f par/J0010J_P1.f2p' 'd decoded' 'f decoded/J0010J_001.csv' | sorted)"
+  expect "decoder calls" "$DCALLS" "$(printf '%s\n' J0010J_P1.f2p J0010J_001.f2b)"
+  contains "log" "$SOUT" "Decoding J0010J: 1 decoded, 0 failed"
+  contains "log" "$SOUT" "Downloads incomplete: 1 source(s) failed: H0008H"
+  contains "log" "$SOUT" "Run finished: 1 source(s) ok, 1 failed, 2 file(s) downloaded."
+  lacks "log" "$SOUT" "All files downloaded successfully."
+}
+
+t_rob_stall() {
+  local start=$SECONDS
+  dscrape "$RS/r2.yml" -e FLEXGATE_SCRAPER_TIMEOUT_SECONDS=2
+  expect "scraper exit code" "$SRC" "1"
+  contains "log" "$SOUT" "ERROR - Source I0009I failed, continuing with the next source: ReadTimeout"
+  expect "I0009I files" "$(vsh 'find /d/I0009I -type f')" ""
+  expect "L0012L downloads" "$(dlisting L0012L)" "$(printf '%s\n' 'd raw' 'f raw/l1.f2p' 'd par' | sorted)"
+  contains "log" "$SOUT" "Run finished: 1 source(s) ok, 1 failed, 1 file(s) downloaded."
+  [ $((SECONDS - start)) -lt 15 ] || fail_t "the run waited for the stalled server ($((SECONDS - start)) s)"
+}
+
+t_rob_bad_timeout() {
+  dscrape "$RS/r4.yml" -e FLEXGATE_SCRAPER_TIMEOUT_SECONDS=soon
+  expect "scraper exit code" "$SRC" "2"
+  contains "log" "$SOUT" "Invalid FLEXGATE_SCRAPER_TIMEOUT_SECONDS='soon'"
+  lacks "log" "$SOUT" "Downloading"
+}
+
+t_rob_partial() {
+  [ -n "$RS" ] || fail_t "the robustness setup did not run"
+  vsh 'mkdir -p /d/K0011K/raw && echo partial > /d/K0011K/.log.txt.part && echo partial > /d/K0011K/raw/.k1.f2p.part' \
+    || fail_t "could not create the partial files"
+  dscrape "$RS/r3.yml" -e SCRAPE_UMASK=077
+  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
+  contains "log" "$SOUT" "Removing partial download /app/downloads/K0011K/.log.txt.part"
+  contains "log" "$SOUT" "Removing partial download /app/downloads/K0011K/raw/.k1.f2p.part"
+  expect "number of downloads" "$(n_downloads "$SOUT")" "2"
+  expect "K0011K downloads" "$(dlisting K0011K)" "$(printf '%s\n' 'f log.txt' 'd raw' 'f raw/k1.f2p' 'd par' | sorted)"
+  expect "content of log.txt" "$(vsh 'cat /d/K0011K/log.txt')" "k log"
+  expect "content of raw/k1.f2p" "$(vsh 'cat /d/K0011K/raw/k1.f2p')" "k raw"
+  expect ".part files left" "$(vsh 'find /d -name "*.part"')" ""
+}
+
+t_rob_mode() {
+  expect "modes" "$(vsh 'stat -c "%a %n" /d/K0011K/log.txt /d/K0011K/raw/k1.f2p /d/L0012L/raw/l1.f2p /d/J0010J/raw/J0010J_001.f2b')" \
+    "$(printf '%s\n' '644 /d/K0011K/log.txt' '644 /d/K0011K/raw/k1.f2p' '644 /d/L0012L/raw/l1.f2p' '644 /d/J0010J/raw/J0010J_001.f2b')"
+}
+
+# A process in the same container holds the lock while the scraper starts
+LOCK_HOLDER='
+import fcntl, os, time
+fd = os.open("/tmp/flexgate_scraper.lock", os.O_RDWR | os.O_CREAT)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open("/tmp/held", "w").close()
+time.sleep(60)
+'
+t_rob_lock() {
+  [ "$DEC_OK" -eq 1 ] || fail_t "the decode test setup failed"
+  local out rc=0
+  out="$(docker run --rm --network "$NET" --name "$(cname)" \
+    -v "$(hp "$RS/r4.yml"):/app/settings.yml:ro" -v "$DECVOL:/app/downloads" -e LOCK_HOLDER="$LOCK_HOLDER" \
+    --entrypoint sh "$IMAGE" -c 'python -c "$LOCK_HOLDER" & pid=$!; i=0
+      while [ ! -e /tmp/held ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+      [ -e /tmp/held ] || { echo "lock holder did not start"; exit 9; }
+      python /app/flexgate_scraper.py; rc=$?; kill $pid; exit $rc' 2>&1)" || rc=$?
+  expect "scraper exit code" "$rc" "0"
+  contains "log" "$out" "WARNING - Lock /tmp/flexgate_scraper.lock is held: another run is in progress, skipping this run."
+  lacks "log" "$out" "Downloading"
+  expect "M0013M folder" "$(vsh 'ls -A /d | grep -x M0013M; true')" ""
+  # without the holder the same settings download the file
+  dscrape "$RS/r4.yml"
+  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC without the lock holder: $SOUT"
+  expect "number of downloads" "$(n_downloads "$SOUT")" "1"
+}
+
 # ---- run -----------------------------------------------------------------------------
 
 for c in bash cron python; do run_test "image has $c" t_has "$c"; done
@@ -562,6 +696,14 @@ run_test "settings: whitespace comment_char is rejected" t_bad_space
 run_test "settings: unknown key in decoding is rejected" t_bad_key
 run_test "settings: unknown key in postprocessing is rejected" t_bad_pp_key
 run_test "entrypoint refuses to start with invalid decoding settings" t_bad_entry
+
+rob_setup
+run_test "robust: HTTP 500 on one logger, next logger downloaded and decoded, exit 1" t_rob_http500
+run_test "robust: stalled server fails only that source after the timeout, exit 1" t_rob_stall
+run_test "robust: invalid timeout override is rejected, nothing downloaded" t_rob_bad_timeout
+run_test "robust: leftover .part files removed and downloaded again, none left" t_rob_partial
+run_test "robust: downloaded files have mode 0644 (also with umask 077)" t_rob_mode
+run_test "robust: second run while the lock is held exits 0 with a WARNING" t_rob_lock
 
 TOTAL=$((PASSED + FAILED))
 if [ "$FAILED" -eq 0 ]; then

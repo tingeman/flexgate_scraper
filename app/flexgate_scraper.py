@@ -1,3 +1,5 @@
+import fcntl
+import os
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
@@ -74,58 +76,127 @@ if "--check-settings" in sys.argv[1:]:
     print(f"Settings in {settings_path} are valid.")
     sys.exit(0)
 
-# Function to download a file
-def download_file(file_url: str, output_path: Path):
+# Network timeouts of every request in seconds, (connect, read). The read timeout is the
+# longest wait for the next data from the server, not for the whole download.
+DEFAULT_TIMEOUT = (10.0, 120.0)
+# Test-only/advanced override: "<seconds>" for both, or "<connect>,<read>"
+TIMEOUT_ENV = "FLEXGATE_SCRAPER_TIMEOUT_SECONDS"
+# Only one run at a time (cron starts a run every hour; a slow run may still be going)
+LOCK_PATH = "/tmp/flexgate_scraper.lock"
+PART_SUFFIX = ".part"
+FILE_MODE = 0o644
+
+
+def request_timeout() -> tuple:
+    value = os.environ.get(TIMEOUT_ENV, "").strip()
+    if not value:
+        return DEFAULT_TIMEOUT
+    try:
+        parts = [float(v) for v in value.split(",")]
+        if len(parts) == 1:
+            parts *= 2
+        if len(parts) != 2 or min(parts) <= 0:
+            raise ValueError
+    except ValueError:
+        logging.error(f"Invalid {TIMEOUT_ENV}={value!r}, expected <seconds> or <connect>,<read>; not running")
+        sys.exit(2)
+    return tuple(parts)
+
+
+def acquire_run_lock():
+    """Take the run lock without waiting. Returns its file descriptor, which must stay open
+    for the whole run, or None if another run holds the lock."""
+    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def part_path(output_path: Path) -> Path:
+    return output_path.with_name(f".{output_path.name}{PART_SUFFIX}")
+
+
+def is_part_file(name: str) -> bool:
+    return name.startswith(".") and name.endswith(PART_SUFFIX)
+
+
+def remove_partial_downloads(folder: Path):
+    """Remove .<name>.part files left by an interrupted run."""
+    for p in folder.iterdir():
+        if is_part_file(p.name) and p.is_file():
+            logging.info(f"Removing partial download {p}")
+            p.unlink()
+
+
+# Function to download a file: written to .<name>.part in the same folder, renamed to its
+# final name once complete
+def download_file(file_url: str, output_path: Path, timeout: tuple):
     logging.info(f"Downloading {file_url}...")
-    response = requests.get(file_url)
+    response = requests.get(file_url, timeout=timeout)
     response.raise_for_status()
 
     # Save the file
-    with output_path.open("wb") as f:
-        f.write(response.content)
-    
+    tmp = part_path(output_path)
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), FILE_MODE)  # independent of the umask
+            f.write(response.content)
+        os.replace(tmp, output_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
     logging.info(f"Saved to {output_path}")
 
+
 # Function to get page content and parse links
-def get_links_from_page(url: str):
-    response = requests.get(url)
+def get_links_from_page(url: str, timeout: tuple):
+    response = requests.get(url, timeout=timeout)
     response.raise_for_status()  # Raise an error if the request failed
     soup = BeautifulSoup(response.text, "html.parser")
     return soup.find_all("a")
 
 
-parsed_url = urlparse(settings.flexgate_browse_url)
-if not parsed_url.scheme or not parsed_url.netloc:
-    raise ValueError("Invalid base URL provided in settings.")
+def get_base_url(browse_url: str) -> str:
+    parsed_url = urlparse(browse_url)
+    if not parsed_url.scheme or not parsed_url.netloc:
+        raise ValueError("Invalid base URL provided in settings.")
 
-base_path = '/'.join(parsed_url.path.split('/')[:-1])
-if not base_path:
-    base_path = "/"
-elif not base_path.endswith("/"):
-    base_path += "/"
+    base_path = '/'.join(parsed_url.path.split('/')[:-1])
+    if not base_path:
+        base_path = "/"
+    elif not base_path.endswith("/"):
+        base_path += "/"
 
-base_url = urlunparse((parsed_url.scheme, parsed_url.netloc, base_path, '', '', ''))
+    return urlunparse((parsed_url.scheme, parsed_url.netloc, base_path, '', '', ''))
 
 
-# Iterate over each source in the settings
-for source in settings.sources:
+def scrape_source(source: Source, base_url: str, timeout: tuple) -> int:
+    """Download what is new for one source and return the number of files downloaded.
+    Network, HTTP and file system errors are raised to the caller."""
+    downloaded = 0
     serial = source.serial
     logger_name = source.logger_name or ""
     folders = source.get_folders_list()
     specific_files = source.get_files_list()
-    
-    logger_url = f"{settings.flexgate_browse_url}?dir=../data/{serial}"  
+
+    logger_url = f"{settings.flexgate_browse_url}?dir=../data/{serial}"
     output_folder_name = logger_folder_name(serial, logger_name)
     base_output_folder = Path(f"{settings.base_download_folder}/{output_folder_name}")
     base_output_folder.mkdir(parents=True, exist_ok=True)
-    
+
     # Download specific files from the main serial page if specified
     if specific_files:
         serial_output_folder = base_output_folder / ""
         serial_output_folder.mkdir(parents=True, exist_ok=True)
+        remove_partial_downloads(serial_output_folder)
 
         # Get links from the serial page
-        links = get_links_from_page(logger_url)
+        links = get_links_from_page(logger_url, timeout)
 
         # Download each specific file if found
         for link in links:
@@ -137,10 +208,11 @@ for source in settings.sources:
                     if file_path.exists():
                         logging.debug(f"Skipping {file_name}, already downloaded.")
                         continue
-                    
+
                     # combine baseurl wiht href
                     file_url = urljoin(base_url, href)
-                    download_file(str(file_url), file_path)
+                    download_file(str(file_url), file_path, timeout)
+                    downloaded += 1
 
     # Download files from specified folders
     for folder in folders:
@@ -154,12 +226,13 @@ for source in settings.sources:
         # Create the destination folder
         output_folder = base_output_folder / folder
         output_folder.mkdir(parents=True, exist_ok=True)
+        remove_partial_downloads(output_folder)
 
-        # Get a listing of the local directory
-        existing_files = set(output_folder.iterdir())
+        # Get a listing of the local directory (a partial download never counts)
+        existing_files = {p for p in output_folder.iterdir() if not is_part_file(p.name)}
 
         # Get links from the folder page
-        links = get_links_from_page(folder_url)
+        links = get_links_from_page(folder_url, timeout)
 
         # Download each file
         for link in links:
@@ -174,13 +247,52 @@ for source in settings.sources:
 
                 # combine baseurl wiht href
                 file_url = urljoin(base_url, href)
-                download_file(str(file_url), file_path)           
+                download_file(str(file_url), file_path, timeout)
+                downloaded += 1
 
-logging.info("All files downloaded successfully.")
+    return downloaded
 
-# Decode step (only with an enabled "decoding" block in the settings)
-run_decoding(settings.decoding, [
-    LoggerSource(serial=s.serial, logger_name=s.logger_name or "",
-                 folder=Path(settings.base_download_folder) / logger_folder_name(s.serial, s.logger_name))
-    for s in settings.sources])
 
+def main() -> int:
+    """One run: downloads for every source, then the decode step. Returns the exit code:
+    1 if any source failed, else 0 (decoding problems do not change it)."""
+    timeout = request_timeout()
+    base_url = get_base_url(settings.flexgate_browse_url)
+
+    try:
+        lock_fd = acquire_run_lock()
+    except OSError as e:
+        logging.error(f"Cannot open the run lock {LOCK_PATH}, not running: {e}")
+        return 1
+    if lock_fd is None:
+        logging.warning(f"Lock {LOCK_PATH} is held: another run is in progress, skipping this run.")
+        return 0
+
+    # Iterate over each source in the settings; a failing source does not stop the others
+    ok, failed, downloaded = 0, [], 0
+    for source in settings.sources:
+        name = logger_folder_name(source.serial, source.logger_name)
+        try:
+            downloaded += scrape_source(source, base_url, timeout)
+            ok += 1
+        except (requests.RequestException, OSError) as e:
+            logging.error(f"Source {name} failed, continuing with the next source: {type(e).__name__}: {e}")
+            failed.append(name)
+
+    if failed:
+        logging.warning(f"Downloads incomplete: {len(failed)} source(s) failed: {', '.join(failed)}")
+    else:
+        logging.info("All files downloaded successfully.")
+
+    # Decode step (only with an enabled "decoding" block in the settings), for all sources
+    run_decoding(settings.decoding, [
+        LoggerSource(serial=s.serial, logger_name=s.logger_name or "",
+                     folder=Path(settings.base_download_folder) / logger_folder_name(s.serial, s.logger_name))
+        for s in settings.sources])
+
+    logging.info(f"Run finished: {ok} source(s) ok, {len(failed)} failed, {downloaded} file(s) downloaded.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

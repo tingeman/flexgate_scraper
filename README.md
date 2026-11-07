@@ -223,6 +223,31 @@ docker compose up --build
     python app/flexgate_scraper.py
     ```
 
+### What a run does
+
+- **Run lock**: a run first takes a lock on `/tmp/flexgate_scraper.lock` (without waiting).
+  If another run still holds it, the run logs a WARNING "another run is in progress,
+  skipping this run" and exits with 0. `--check-settings` does not take the lock.
+- **Timeouts**: every request to the server has a connect timeout of 10 s and a read
+  timeout of 120 s (the longest wait for the next data, not for the whole download).
+  Test-only/advanced: the environment variable `FLEXGATE_SCRAPER_TIMEOUT_SECONDS` overrides
+  them, as `<seconds>` for both or `<connect>,<read>`; an invalid value stops the run with
+  exit code 2.
+- **One source at a time**: a source (logger) whose listing or download fails (network
+  error, timeout, HTTP error, file system error) is logged as an ERROR naming the source and
+  the reason, and the run continues with the next source. The decode step still runs for
+  all sources afterwards. "All files downloaded successfully." is logged only when no source
+  failed; otherwise a WARNING lists the failed sources. The run ends with a summary line
+  (`Run finished: <n> source(s) ok, <m> failed, <k> file(s) downloaded.`).
+- **Partial downloads**: a file is written as `.<name>.part` in its folder and renamed to
+  its final name only when it is complete, so a file with its final name is always whole.
+  Files get mode 0644 whatever the umask. Leftover `.part` files from an interrupted run
+  are removed (logged at INFO) when the folder is processed next, and the file is
+  downloaded again.
+- **Exit codes**: 0 when all sources were processed (or the run was skipped because of the
+  lock), 1 when any source failed, 2 for invalid settings. Decoding failures do not change
+  the exit code.
+
 ## Build
 
 The Dockerfile pins the base image by digest and installs the Python packages from a hash
@@ -261,7 +286,11 @@ syntax), the entrypoint (cron jobs installed with mode 0644, refusal to start wi
 settings) and the scraper itself: it is run against a local fake FlexGate server
 (`tests/fake_flexgate.py`) on a private `--internal` docker network, and the tests check
 where files land, that a second run downloads nothing and that a new file on the server is
-picked up. The decode step is tested with a stub
+picked up. Run robustness is tested with the fake server's control files (`.fake_status`
+answers a listing with an HTTP error, `.fake_delay` stalls it; see `tests/fake_flexgate.py`):
+a failing or stalled logger does not stop the next one and gives exit code 1, leftover
+`.part` files are removed and downloaded again, downloaded files have mode 0644, and a run
+started while the lock is held exits 0 without downloading. The decode step is tested with a stub
 decoder (`tests/stub_decode3.py`, which mimics the real decoder's file handling) installed in
 a docker volume: decode once, parameter sets first, missing parameter sets, failures and
 timeouts, post-processing, file modes, nothing written next to the downloaded files, and

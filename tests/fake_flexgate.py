@@ -13,11 +13,18 @@ are answered:
   any other path under <root>
       the file itself
 
+Test behaviours are set by control files in a directory under <root> (never listed):
+  .fake_status   contains an HTTP status code: the listing of this directory and of the
+                 directories below it is answered with that status (e.g. 500)
+  .fake_delay    contains seconds: the server waits that long before answering the
+                 listing of this directory or of the directories below it
+
 Only the standard library is used, so it runs in the scraper image. Each request is
 logged to stdout as "REQ <path>".
 """
 import html
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -25,6 +32,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 ROOT = Path(sys.argv[1]).resolve()
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 SW_DIR = ROOT / "fg2lite" / "sw"
+CONTROL_FILES = (".fake_status", ".fake_delay")
 
 
 def inside_root(path: Path) -> bool:
@@ -33,6 +41,20 @@ def inside_root(path: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def control(directory: Path):
+    """(status, delay) from the control files in directory or in its parents up to ROOT"""
+    status, delay = 0, 0.0
+    d = directory.resolve()
+    while True:
+        if not status and (d / ".fake_status").is_file():
+            status = int((d / ".fake_status").read_text().strip())
+        if not delay and (d / ".fake_delay").is_file():
+            delay = float((d / ".fake_delay").read_text().strip())
+        if d == ROOT or d == d.parent:
+            return status, delay
+        d = d.parent
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -63,9 +85,17 @@ class Handler(BaseHTTPRequestHandler):
         if not rel_dir or not inside_root(directory) or not directory.is_dir():
             self.send(404, b"no such directory")
             return
+        status, delay = control(directory)
+        if delay:
+            time.sleep(delay)
+        if status:
+            self.send(status, f"fake status {status}".encode())
+            return
         rel_dir = rel_dir.rstrip("/")
         rows = ['<a href="index.php">Home</a>']
         for entry in sorted(directory.iterdir()):
+            if entry.name in CONTROL_FILES:
+                continue
             name = html.escape(entry.name)
             if entry.is_dir():
                 href = "browse.php?dir=" + quote(f"{rel_dir}/{entry.name}", safe="")
