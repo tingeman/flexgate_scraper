@@ -5,8 +5,8 @@ services:
       context: .
     volumes:
       - ./config/cron_jobs:/app/cron_jobs
-      - ./config/settings.yml:/app/settings.yml
-      - flexgate_data:/app/downloads  # Use Docker volume for downloaded files
+      - ./config/settings.yml:/app/settings.yml  # must be readable by uid 30000 (dockeruser)
+      - flexgate_data:/app/downloads  # Use Docker volume for downloaded files (owned by dockeruser)
     environment:
       - TZ=UTC
     restart: unless-stopped
@@ -16,3 +16,5 @@ volumes:
 
 
 # docker exec -it flexgate_scraper /bin/bash
+# Manual run (the scraper refuses root):
+# docker exec -u dockeruser flexgate_scraper python /app/flexgate_scraper.py

@@ -54,6 +54,19 @@ class Settings(BaseSettings):
         return self
 
 
+# Never run as root: everything the scraper writes must belong to the scraper user (the
+# entrypoint runs as root only to start cron and repair ownership). Also for --check-settings.
+SCRAPER_USER = os.environ.get("FLEXGATE_SCRAPER_USER") or "dockeruser"
+if os.geteuid() == 0:
+    logging.error(f"Refusing to run as root: run the scraper as the scraper user {SCRAPER_USER}, e.g. "
+                  f"docker exec -u {SCRAPER_USER} flexgate_scraper python /app/flexgate_scraper.py")
+    sys.exit(2)
+
+# Folders and files the scraper creates get mode 0755/0644 whatever umask it was started
+# with (also intermediate folders from mkdir(parents=True), which an explicit chmod after
+# each mkdir would miss); downloads and published CSVs also set 0644 explicitly.
+os.umask(0o022)
+
 # Get the directory of the current script
 script_dir = Path(__file__).parent
 
@@ -106,7 +119,8 @@ def request_timeout() -> tuple:
 def acquire_run_lock():
     """Take the run lock without waiting. Returns its file descriptor, which must stay open
     for the whole run, or None if another run holds the lock."""
-    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    # read-only is enough for flock, and also works on a lock file another user created
+    fd = os.open(LOCK_PATH, os.O_RDONLY | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

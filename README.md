@@ -28,6 +28,7 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 │       └── cron_scrape_20m
 ├── docker-compose.yml
 ├── Dockerfile
+├── as-dockeruser.sh       # privilege drop to the scraper user (cron jobs, entrypoint)
 ├── entrypoint.sh
 ├── tests/
 │   ├── run.sh
@@ -218,7 +219,7 @@ docker compose up --build
     ```sh
     pip install -r app/requirements.txt
     ```
-2. Run the scraper:
+2. Run the scraper (as a normal user; it refuses to run as root):
     ```sh
     python app/flexgate_scraper.py
     ```
@@ -227,7 +228,8 @@ docker compose up --build
 
 - **Run lock**: a run first takes a lock on `/tmp/flexgate_scraper.lock` (without waiting).
   If another run still holds it, the run logs a WARNING "another run is in progress,
-  skipping this run" and exits with 0. `--check-settings` does not take the lock.
+  skipping this run" and exits with 0. `--check-settings` does not take the lock. The
+  entrypoint removes a lock file left by an earlier start of the container.
 - **Timeouts**: every request to the server has a connect timeout of 10 s and a read
   timeout of 120 s (the longest wait for the next data, not for the whole download).
   Test-only/advanced: the environment variable `FLEXGATE_SCRAPER_TIMEOUT_SECONDS` overrides
@@ -245,8 +247,46 @@ docker compose up --build
   are removed (logged at INFO) when the folder is processed next, and the file is
   downloaded again.
 - **Exit codes**: 0 when all sources were processed (or the run was skipped because of the
-  lock), 1 when any source failed, 2 for invalid settings. Decoding failures do not change
-  the exit code.
+  lock), 1 when any source failed, 2 for invalid settings or a start as root. Decoding
+  failures do not change the exit code.
+
+## User and file ownership
+
+- **The scraper user** is `dockeruser`, uid = gid 30000, as in the other images of the
+  data server (build arguments `USERNAME`, `USER_UID`, `USER_GID`; the name is also in the
+  environment variable `FLEXGATE_SCRAPER_USER`). It has no password and there is no sudo.
+- **Root is refused**: the scraper (also `--check-settings`) exits with code 2 and an ERROR
+  when started as root, so every file it writes belongs to the scraper user. Folders it
+  creates get mode 0755 and files 0644, whatever the umask.
+- **Cron stays root**: the container's main process (the entrypoint, then `cron -f`) runs as
+  root, because cron must start the jobs.
+- **Cron job lines** keep the user field `root` and send the output to the container log
+  with `> /proc/1/fd/1 2>&1`, the same cron logging as backup_service (Docker rotates the
+  container log). The root shell opens `/proc/1/fd/1`; a job running as `dockeruser` could
+  not (PID 1 is cron, owned by root: "Permission denied"). Only the command drops to the
+  scraper user, through the image's one privilege drop `/usr/local/bin/as-dockeruser`
+  (`setpriv --reuid=dockeruser --regid=dockeruser --init-groups <command...>`, run in `/app`
+  with `HOME=/home/dockeruser`, because a root cron job starts in `/root`, which the user
+  cannot read), which the entrypoint also uses for `--check-settings`:
+
+  ```
+  20 * * * * root /usr/local/bin/as-dockeruser /usr/local/bin/python /app/flexgate_scraper.py > /proc/1/fd/1 2>&1
+  ```
+
+  A line without `as-dockeruser` runs the scraper as root, which it refuses: the ERROR
+  appears in the container log at every run.
+- **Ownership repair at start**: the entrypoint (as root) hands everything in
+  `/app/downloads` that does not belong to `dockeruser:dockeruser` to that user and logs one
+  line with the number of entries changed, e.g. files written by earlier versions that ran
+  as root. When everything already belongs to the user, it logs nothing. A new, empty volume
+  mounted at `/app/downloads` belongs to the user from the start (the image's folder does).
+- **Settings** must be readable by `dockeruser`; the entrypoint checks them as that user and
+  refuses to start otherwise.
+- **Manual runs** go through `docker exec` as the scraper user:
+
+  ```sh
+  docker exec -u dockeruser flexgate_scraper python /app/flexgate_scraper.py
+  ```
 
 ## Build
 
@@ -294,7 +334,12 @@ started while the lock is held exits 0 without downloading. The decode step is t
 decoder (`tests/stub_decode3.py`, which mimics the real decoder's file handling) installed in
 a docker volume: decode once, parameter sets first, missing parameter sets, failures and
 timeouts, post-processing, file modes, nothing written next to the downloaded files, and
-rejected settings. All other containers run with `--network none`, and all containers, the
+rejected settings. Scraper runs happen as `dockeruser`; the user tests check the user and
+its folders in the image, that a run as root is refused, owners and modes under umask 077,
+the ownership repair at the entrypoint start (once, with the count), and that a cron job line
+in the production form (`root`, `as-dockeruser`, `> /proc/1/fd/1`) runs as uid 30000 with its
+output in the container log, while a line without `as-dockeruser` logs the root refusal
+(this waits for the next cron minute). All other containers run with `--network none`, and all containers, the
 network, the volumes and temporary folders are removed at the end. Each check prints `PASS:` or `FAIL:`, and the
 run ends with `ALL <n> TESTS PASSED` (exit 0) or `<m> OF <n> TESTS FAILED` (exit 1).
 
@@ -303,7 +348,13 @@ run ends with `ALL <n> TESTS PASSED` (exit 0) or `<m> OF <n> TESTS FAILED` (exit
 To run the scraper periodically, use the cron job template in [`config/cron_jobs/cron_scrape_20m`](config/cron_jobs/cron_scrape_20m).
 
 All files in `config/cron_jobs/` will be automatically installed as cron jobs in the container when 
-built using docker compose.
+built using docker compose. A job line has the user field `root`, runs the scraper through
+`as-dockeruser` and sends its output to the container log (see
+[User and file ownership](#user-and-file-ownership)):
+
+```
+20 * * * * root /usr/local/bin/as-dockeruser /usr/local/bin/python /app/flexgate_scraper.py > /proc/1/fd/1 2>&1
+```
 
 ## License
 

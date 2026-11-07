@@ -12,8 +12,10 @@
 ## 
 ##--------------------------------------------------------------------------------------------------
 
-# Run the scraper hourly, 20 min past the hour
-20 * * * * root /usr/local/bin/python /app/flexgate_scraper.py >> /var/log/cron.log 2>&1
+# Run the scraper hourly, 20 min past the hour. The user field is root, so the root shell
+# opens /proc/1/fd/1 (the container log, as in backup_service); the scraper itself runs as
+# dockeruser through as-dockeruser (it refuses root).
+20 * * * * root /usr/local/bin/as-dockeruser /usr/local/bin/python /app/flexgate_scraper.py > /proc/1/fd/1 2>&1
 
 # cron.d scripts must specify the user to run the command
 # cron.d scripts must have a blank line (or comment) at the end
