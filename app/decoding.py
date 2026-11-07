@@ -256,24 +256,38 @@ def decode_logger(dec: Decoder, src: LoggerSource) -> Tuple[int, int]:
     return decoded, failed
 
 
-def run_decoding(cfg: Optional[DecodingSettings], sources: Iterable[LoggerSource]) -> None:
-    """The decode step of one scraper run. Never raises for decoding problems."""
+@dataclass(frozen=True)
+class DecodeTotals:
+    """What the decode step of one run did, summed over the loggers (for the status file)."""
+    decoded: int = 0
+    failed: int = 0              # data files that failed, plus 1 per logger whose decoding raised
+    error: Optional[str] = None  # set when the decode step could not run at all
+
+
+def run_decoding(cfg: Optional[DecodingSettings], sources: Iterable[LoggerSource]) -> DecodeTotals:
+    """The decode step of one scraper run. Never raises for decoding problems. Returns the
+    totals; 0/0 when decoding is off."""
     if cfg is None or not cfg.enabled:
-        return
+        return DecodeTotals()
     path = cfg.decoder_path
     if not (os.path.isfile(path) and os.access(path, os.X_OK)):
         log.error("Decoder %s is missing or not executable; nothing decoded in this run", path)
-        return
+        return DecodeTotals(error=f"decoder {path} is missing or not executable")
     try:
         dec = Decoder(cfg)
     except OSError as e:
         log.error("Could not create the decoder work folder; nothing decoded in this run: %s", e)
-        return
+        return DecodeTotals(error=f"could not create the decoder work folder: {e}")
+    decoded = failed = 0
     try:
         for src in sources:
             try:
-                decode_logger(dec, src)
+                d, f = decode_logger(dec, src)
+                decoded += d
+                failed += f
             except Exception:
                 log.exception("Decoding %s failed", src.folder.name)
+                failed += 1
     finally:
         dec.close()
+    return DecodeTotals(decoded=decoded, failed=failed)

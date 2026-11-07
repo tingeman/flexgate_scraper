@@ -10,6 +10,14 @@ services:
     environment:
       - TZ=UTC
     restart: unless-stopped
+    # Unhealthy when the last run (hourly at :20, see config/cron_jobs) is older than 130
+    # minutes or had a failed source or a decode failure; see README, "Healthcheck".
+    # No start_period: the script itself is healthy for 130 minutes after the start.
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py", "--max-age-minutes", "130"]
+      interval: 5m
+      timeout: 30s
+      retries: 1
 
 volumes:
   flexgate_data:

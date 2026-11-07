@@ -11,6 +11,8 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
   GeoPrecision's decoder program (not included; see
   [Decoding GeoPrecision data files](#decoding-geoprecision-data-files)).
 - Easily configurable via YAML settings.
+- Writes a status file at the end of every run and ships a container healthcheck script
+  (see [Healthcheck](#healthcheck)).
 
 ## Project Structure
 
@@ -19,6 +21,7 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 ├── app/
 │   ├── decoding.py
 │   ├── flexgate_scraper.py
+│   ├── healthcheck.py     # container healthcheck (status of the last run)
 │   ├── requirements.in
 │   ├── requirements.txt
 │   └── settings.yml
@@ -249,6 +252,76 @@ docker compose up --build
 - **Exit codes**: 0 when all sources were processed (or the run was skipped because of the
   lock), 1 when any source failed, 2 for invalid settings or a start as root. Decoding
   failures do not change the exit code.
+- **Status file**: at the end of every run, also one that fails with an unexpected error,
+  the run writes `/var/lib/flexgate_scraper/status.json` (see [Healthcheck](#healthcheck)).
+  `--check-settings` and a run skipped because of the lock do not write it.
+
+## Healthcheck
+
+### Status file
+
+`/var/lib/flexgate_scraper/status.json` is written atomically (temporary file in the same
+folder, then a rename; mode 0644, owner `dockeruser`) at the end of every run that took the
+run lock. It is in the container's own files, not in the downloads volume, so backups of the
+downloads never copy it; a new container starts without one. A failure to write it is
+logged as an ERROR and does not change the exit code. Fields:
+
+| Field | Meaning |
+|---|---|
+| `version` | format version of the file, `1` |
+| `started`, `finished` | start and end of the run, UTC, ISO 8601 with `Z` (`2026-11-07T12:20:03Z`) |
+| `ok` | `true` only if no source failed, no file failed to decode, the decode step could run and no unexpected error happened |
+| `sources_ok` | number of sources processed without error |
+| `sources_failed` | list of the failed sources' folder names (`<serial>_<logger_name>` or `<serial>`) |
+| `files_downloaded` | files downloaded in this run |
+| `files_decoded`, `decode_failed` | data files decoded / failed in this run (`0` without decoding); a logger whose decoding raised unexpectedly counts as one failure |
+| `decode_error` | why the decode step could not run at all (e.g. a missing decoder), else `null` |
+| `error` | an unexpected error that ended the run (`<type>: <message>`), else `null` |
+
+Test-only: the environment variable `FLEXGATE_SCRAPER_STATUS_FILE` replaces the path, for
+the scraper and the healthcheck script.
+
+### Healthcheck script
+
+```sh
+python /app/healthcheck.py --max-age-minutes 130
+```
+
+Exit 0 (healthy) when the last run finished less than `--max-age-minutes` (default 130)
+ago and was `ok`; exit 1 (unhealthy) otherwise. It prints one line, which
+`docker inspect` shows as the health log, e.g.
+
+```
+healthy: last run 2026-11-07T12:20:41Z, 4 sources, 2 downloaded, 2 decoded
+unhealthy: last run 2026-11-07T12:20:41Z had 1 failed source(s): A0001A_SITE-01
+unhealthy: 3 decode failure(s) in the last run (2026-11-07T12:20:41Z)
+unhealthy: last run finished 190 min ago (max 130)
+unhealthy: status file unreadable: ...
+```
+
+- **Grace after the start**: without a status file, the container is healthy for
+  `--max-age-minutes` after it started (the start time of PID 1, from `/proc`) and then
+  unhealthy (`no run since the container started ... min ago`). A status file from before
+  the start (left by `docker restart`) is not counted as too old during that time either;
+  its `ok` still counts. So no `start_period` is needed.
+- **Failures stay visible**: a failed source or a decode failure (for example a missing
+  parameter set, which is retried every run) makes the container unhealthy until a run is
+  clean again.
+- With the hourly run at :20, 130 minutes allow one missed or slow run.
+- The script uses only the standard library and runs as any user (Docker runs it as root,
+  the image's process user). Test-only options `--now` and `--started` (ISO 8601) replace
+  the clock and the container start time.
+
+The example [`docker-compose.yml`](docker-compose.yml) sets it; the Dockerfile has no
+`HEALTHCHECK`, so the compose file that runs the container decides:
+
+```yaml
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py", "--max-age-minutes", "130"]
+      interval: 5m
+      timeout: 30s
+      retries: 1
+```
 
 ## User and file ownership
 
@@ -330,7 +403,11 @@ picked up. Run robustness is tested with the fake server's control files (`.fake
 answers a listing with an HTTP error, `.fake_delay` stalls it; see `tests/fake_flexgate.py`):
 a failing or stalled logger does not stop the next one and gives exit code 1, leftover
 `.part` files are removed and downloaded again, downloaded files have mode 0644, and a run
-started while the lock is held exits 0 without downloading. The decode step is tested with a stub
+started while the lock is held exits 0 without downloading. The status tests check the
+status file after a clean run, a failed source, a decode failure and a missing decoder
+(fields, owner, mode, nothing in the downloads), that a run skipped by the lock leaves it
+alone, the healthcheck's reasons and its age and grace logic (with the test-only clock
+options), and that a fresh container with a docker healthcheck becomes `healthy`. The decode step is tested with a stub
 decoder (`tests/stub_decode3.py`, which mimics the real decoder's file handling) installed in
 a docker volume: decode once, parameter sets first, missing parameter sets, failures and
 timeouts, post-processing, file modes, nothing written next to the downloaded files, and

@@ -409,13 +409,16 @@ dec_setup() {
   docker volume create "$DECVOL" >/dev/null 2>&1 || return 0
   docker volume create "$STUBVOL" >/dev/null 2>&1 || return 0
   docker run --rm --network none --entrypoint sh -v "$STUBVOL:/stub" -v "$(hp "$TESTS_DIR"):/src:ro" "$IMAGE" \
-    -c 'cp /src/stub_decode3.py /stub/decode3 && chmod 0755 /stub/decode3 && mkdir -p /stub/keep && chown -R 30000:30000 /stub' >/dev/null 2>&1 || return 0
+    -c 'cp /src/stub_decode3.py /stub/decode3 && chmod 0755 /stub/decode3 && mkdir -p /stub/keep /stub/status && chown -R 30000:30000 /stub' >/dev/null 2>&1 || return 0
   DEC_OK=1
 }
 
 # One scraper run with the decode volumes; sets SOUT, SRC and DCALLS (the inputs the stub
 # was called with, one per line, in order). Fails if anything is left in /tmp after the run
-# (the decoder work folder must be removed, also after errors; the run lock file stays).
+# (the decoder work folder must be removed, also after errors; the run lock file stays) or
+# anything but status.json in /var/lib/flexgate_scraper. The run's status file is copied to
+# /stub/status/last.json and its "<uid>:<gid> <mode>" to /stub/status/last.meta ("none"
+# without a status file), for the status and healthcheck tests.
 #   dscrape <settings file> [docker run arguments...]
 # -e SCRAPE_UMASK=<umask> runs the scraper with that umask (default 022).
 dscrape() {
@@ -426,9 +429,16 @@ dscrape() {
   SOUT="$(docker run --rm --network "$NET" --name "$PFX-dec-run-$RANDOM" --user "$SU" \
     -v "$(hp "$settings"):/app/settings.yml:ro" -v "$DECVOL:/app/downloads" -v "$STUBVOL:/stub" \
     -e STUB_DECODE3_CALLS="$calls" -e STUB_DECODE3_KEEP=/stub/keep "$@" \
-    --entrypoint sh "$IMAGE" -c 'umask "${SCRAPE_UMASK:-022}"; python /app/flexgate_scraper.py; rc=$?
-      ls -A /tmp | grep -vx flexgate_scraper.lock | sed "s/^/TMPLEFT /"; exit $rc' 2>&1)" || SRC=$?
+    --entrypoint sh "$IMAGE" -c 'rm -f /stub/status/last.json /stub/status/last.meta
+      umask "${SCRAPE_UMASK:-022}"; python /app/flexgate_scraper.py; rc=$?
+      ls -A /tmp | grep -vx flexgate_scraper.lock | sed "s/^/TMPLEFT /"
+      ls -A /var/lib/flexgate_scraper | grep -vx status.json | sed "s/^/STATELEFT /"
+      st=/var/lib/flexgate_scraper/status.json
+      if [ -e $st ]; then cp $st /stub/status/last.json; stat -c "%u:%g %a" $st > /stub/status/last.meta
+      else echo none > /stub/status/last.meta; fi
+      exit $rc' 2>&1)" || SRC=$?
   lacks "work folder left in /tmp" "$SOUT" "TMPLEFT"
+  lacks "files left in /var/lib/flexgate_scraper" "$SOUT" "STATELEFT"
   DCALLS="$(vsh "cat $calls 2>/dev/null; true")"
 }
 dlisting() { vsh "cd /d/$1 && find . -mindepth 1 -printf '%y %P\n'" | sorted; }
@@ -459,6 +469,158 @@ print("ok", n)
 check_commented() {   # check_commented <stub csv> <published csv> <comment_char>
   docker run --rm --network none --entrypoint python -v "$DECVOL:/d:ro" -v "$STUBVOL:/stub:ro" "$IMAGE" \
     -c "$CHECK_COMMENTED" "$@" 2>&1 || fail_t "comment_metadata output is wrong"
+}
+
+# ---- status file and healthcheck -----------------------------------------------------
+# Each status test follows the scraper test whose run it checks and reads the status file
+# that dscrape saved (/stub/status/last.json).
+
+# Fields of the saved status file on one line (also checks the field set and the time
+# formats), then "meta=<uid>:<gid> <mode>" of the status file in the container
+ST_SUMMARY='
+import json, re, sys
+st = json.load(open(sys.argv[1]))
+keys = ["version", "ok", "sources_ok", "sources_failed", "files_downloaded", "files_decoded",
+        "decode_failed", "decode_error", "error"]
+assert sorted(st) == sorted(keys + ["started", "finished"]), sorted(st)
+for k in ("started", "finished"):
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", st[k]), (k, st[k])
+assert st["started"] <= st["finished"], (st["started"], st["finished"])
+print(" ".join(k + "=" + json.dumps(st[k], separators=(",", ":")) for k in keys))
+'
+st_summary() {
+  docker run --rm --network none -v "$STUBVOL:/stub:ro" -e ST_SUMMARY="$ST_SUMMARY" --entrypoint sh "$IMAGE" -c \
+    'python -c "$ST_SUMMARY" /stub/status/last.json && echo "meta=$(cat /stub/status/last.meta)"' 2>&1 | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Healthcheck as the scraper user against the saved status file; sets HOUT and HRC.
+#   hc [healthcheck arguments...]   real clock and container start time
+#   hc_rel <now> <started>          --now and --started in minutes after the saved status's
+#                                   "finished" (negative: before)
+hc() {
+  HRC=0
+  HOUT="$(docker run --rm --network none --user "$SU" -v "$STUBVOL:/stub:ro" \
+    -e FLEXGATE_SCRAPER_STATUS_FILE=/stub/status/last.json --entrypoint python "$IMAGE" \
+    /app/healthcheck.py --max-age-minutes 130 "$@" 2>&1)" || HRC=$?
+}
+REL_PY='
+import json, sys
+from datetime import timedelta
+sys.path.insert(0, "/app")
+from healthcheck import format_time, parse_time, status_file_path
+finished = parse_time(json.load(open(status_file_path()))["finished"])
+print(format_time(finished + timedelta(minutes=int(sys.argv[1]))))
+'
+hc_rel() {
+  HRC=0
+  HOUT="$(docker run --rm --network none --user "$SU" -v "$STUBVOL:/stub:ro" -e REL_PY="$REL_PY" \
+    -e FLEXGATE_SCRAPER_STATUS_FILE=/stub/status/last.json --entrypoint sh "$IMAGE" -c '
+      set -e; now="$(python -c "$REL_PY" "$1")"; started="$(python -c "$REL_PY" "$2")"
+      exec python /app/healthcheck.py --max-age-minutes 130 --now "$now" --started "$started"' sh "$1" "$2" 2>&1)" || HRC=$?
+}
+hc_expect() {   # hc_expect <exit code> <text in the output>; after hc or hc_rel (one line)
+  expect "healthcheck exit code ($HOUT)" "$HRC" "$1"
+  contains "healthcheck output" "$HOUT" "$2"
+  expect "healthcheck output lines" "$(printf '%s\n' "$HOUT" | wc -l | tr -d ' ')" "1"
+}
+
+t_status_clean() {
+  expect "status" "$(st_summary)" 'version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=3 files_decoded=2 decode_failed=0 decode_error=null error=null meta=30000:30000 644'
+  expect "status-like files in the downloads volume" "$(vsh 'find /d \( -name "*status*" -o -name "*.json" \) -print')" ""
+  hc
+  hc_expect 0 "healthy: last run "
+  contains "healthcheck output" "$HOUT" ", 1 sources, 3 downloaded, 2 decoded"
+}
+
+t_status_age() {
+  hc_rel 60 -300
+  hc_expect 0 "healthy: last run "
+  hc_rel 190 -300
+  hc_expect 1 "unhealthy: last run finished 190 min ago (max 130)"
+  # restarted 40 min ago, the old status file is still there: grace
+  hc_rel 190 150
+  hc_expect 0 "healthy: last run "
+}
+
+t_status_decode_fail() {
+  expect "status" "$(st_summary)" 'version=1 ok=false sources_ok=2 sources_failed=[] files_downloaded=1 files_decoded=0 decode_failed=1 decode_error=null error=null meta=30000:30000 644'
+  hc
+  hc_expect 1 "unhealthy: 1 decode failure(s) in the last run ("
+}
+
+t_status_no_decoder() {
+  expect "status" "$(st_summary)" 'version=1 ok=false sources_ok=1 sources_failed=[] files_downloaded=1 files_decoded=0 decode_failed=0 decode_error="decoder /opt/nothere/decode3 is missing or not executable" error=null meta=30000:30000 644'
+  hc
+  hc_expect 1 "could not decode: decoder /opt/nothere/decode3 is missing or not executable"
+}
+
+t_status_failed_source() {
+  expect "status" "$(st_summary)" 'version=1 ok=false sources_ok=1 sources_failed=["H0008H"] files_downloaded=2 files_decoded=1 decode_failed=0 decode_error=null error=null meta=30000:30000 644'
+  hc
+  hc_expect 1 "had 1 failed source(s): H0008H"
+  contains "healthcheck output" "$HOUT" "unhealthy: last run 20"
+}
+
+# Without a status file: grace after the container start (overridden); unreadable files
+t_status_none() {
+  local args=(--rm --network none --user "$SU" --entrypoint python "$IMAGE" /app/healthcheck.py --now 2026-11-07T12:00:00Z)
+  HRC=0; HOUT="$(docker run "${args[@]}" --started 2026-11-07T11:00:00Z 2>&1)" || HRC=$?
+  hc_expect 0 "healthy: no run yet, container started 60 min ago (grace 130 min)"
+  HRC=0; HOUT="$(docker run "${args[@]}" --started 2026-11-07T09:50:00Z 2>&1)" || HRC=$?
+  hc_expect 1 "unhealthy: no run since the container started 130 min ago (max 130)"
+  HRC=0; HOUT="$(docker run -e FLEXGATE_SCRAPER_STATUS_FILE=/app/settings.yml "${args[@]}" 2>&1)" || HRC=$?
+  hc_expect 1 "unhealthy: status file unreadable: /app/settings.yml"
+  HRC=0; HOUT="$(docker run -e FLEXGATE_SCRAPER_STATUS_FILE=/app "${args[@]}" 2>&1)" || HRC=$?
+  hc_expect 1 "unhealthy: status file unreadable: /app"
+}
+
+# A run that ends with an unexpected exception (scrape_source replaced by one that raises)
+# still writes the status file, with the error
+RAISING_RUN='
+import json, subprocess, sys
+sys.argv = ["flexgate_scraper.py"]
+sys.path.insert(0, "/app")
+import flexgate_scraper
+def boom(*args):
+    raise RuntimeError("boom")
+flexgate_scraper.scrape_source = boom
+try:
+    flexgate_scraper.main()
+    print("main did not raise")
+except RuntimeError:
+    pass
+st = json.load(open("/var/lib/flexgate_scraper/status.json"))
+print("STATUS", st["ok"], st["error"])
+'
+t_status_exception() {
+  local out
+  out="$(docker run --rm --network none --user "$SU" -e RAISING_RUN="$RAISING_RUN" --entrypoint sh "$IMAGE" -c \
+    'python -c "$RAISING_RUN" && python /app/healthcheck.py; echo "HC $?"' 2>&1)"
+  lacks "output" "$out" "main did not raise"
+  contains "status" "$out" "STATUS False RuntimeError: boom"
+  contains "healthcheck" "$out" "failed: RuntimeError: boom"
+  contains "healthcheck exit code" "$out" "HC 1"
+}
+
+# Entrypoint container with a docker healthcheck: healthy in the grace period (real start
+# time of PID 1), also for docker exec as the scraper user; the settings check at the start
+# writes no status file
+t_status_docker_health() {
+  mkenv health
+  local name health out state
+  name="$(cname)"
+  start_entry "$name" --network none --health-cmd "python /app/healthcheck.py --max-age-minutes 130" \
+    --health-interval 2s --health-retries 1
+  wait_until 40 sh -c "docker inspect -f '{{.State.Health.Status}}' '$name' | grep -qx healthy" || true
+  health="$(docker inspect -f '{{.State.Health.Status}}' "$name")"
+  out="$(docker inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' "$name")"
+  state="$(docker exec "$name" ls -A /var/lib/flexgate_scraper)"
+  HRC=0; HOUT="$(docker exec -u "$SU" "$name" python /app/healthcheck.py 2>&1)" || HRC=$?
+  docker rm -f "$name" >/dev/null
+  expect "health status" "$health" "healthy"
+  contains "health log" "$out" "healthy: no run yet, container started 0 min ago (grace 130 min)"
+  expect "/var/lib/flexgate_scraper after the settings check" "$state" ""
+  hc_expect 0 "healthy: no run yet, container started 0 min ago"
 }
 
 t_dec_absent() {
@@ -727,13 +889,17 @@ t_cron_job() {
     '* * * * * root /usr/local/bin/as-dockeruser sh -c '"'"'echo "cron job uid: $(id -u):$(id -g)"; exec /usr/local/bin/python /app/flexgate_scraper.py'"'"' > /proc/1/fd/1 2>&1' \
     '* * * * * root /usr/local/bin/python /app/flexgate_scraper.py --check-settings > /proc/1/fd/1 2>&1' \
     > "$E/cron/cron_test"
-  local name out owner
+  local name out owner st
   name="$(cname)"
   start_entry "$name" --network "$NET" -v "$REPVOL:/app/downloads"
   wait_until 150 sh -c "docker logs '$name' 2>&1 | grep -q 'Run finished' && docker logs '$name' 2>&1 | grep -q 'Refusing'" || true
   out="$(docker logs "$name" 2>&1)"
   owner="$(docker exec "$name" stat -c '%U:%G %a' /app/downloads/O0015O/raw/o1.f2p 2>&1 || true)"
+  st="$(docker exec "$name" stat -c '%U:%G %a' /var/lib/flexgate_scraper/status.json 2>&1 || true)"
+  HRC=0; HOUT="$(docker exec "$name" python /app/healthcheck.py 2>&1)" || HRC=$?
   docker rm -f "$name" >/dev/null
+  expect "status file of the cron run" "$st" "dockeruser:dockeruser 644"
+  hc_expect 0 "healthy: last run "
   contains "container log" "$out" "cron job uid: 30000:30000"
   contains "container log" "$out" "Run finished: 1 source(s) ok, 0 failed, 1 file(s) downloaded."
   contains "container log (line without the privilege drop)" "$out" "ERROR - Refusing to run as root"
@@ -772,6 +938,31 @@ t_rob_lock() {
   expect "number of downloads" "$(n_downloads "$SOUT")" "1"
 }
 
+# A run skipped because the lock is held leaves the status file alone
+t_status_lock() {
+  [ "$DEC_OK" -eq 1 ] || fail_t "the decode test setup failed"
+  local out rc=0
+  out="$(docker run --rm --network "$NET" --name "$(cname)" --user "$SU" \
+    -v "$(hp "$RS/r4.yml"):/app/settings.yml:ro" -v "$DECVOL:/app/downloads" -e LOCK_HOLDER="$LOCK_HOLDER" \
+    --entrypoint sh "$IMAGE" -c 'python -c "$LOCK_HOLDER" & pid=$!; i=0
+      while [ ! -e /tmp/held ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+      [ -e /tmp/held ] || { echo "lock holder did not start"; exit 9; }
+      echo earlier > /var/lib/flexgate_scraper/status.json
+      python /app/flexgate_scraper.py; rc=$?; kill $pid
+      echo "STATE $(ls -A /var/lib/flexgate_scraper) $(cat /var/lib/flexgate_scraper/status.json)"; exit $rc' 2>&1)" || rc=$?
+  expect "scraper exit code" "$rc" "0"
+  contains "log" "$out" "another run is in progress, skipping this run."
+  contains "status folder" "$out" "STATE status.json earlier"
+}
+
+# A status file that cannot be written: ERROR in the log, exit code unchanged
+t_status_write_fail() {
+  dscrape "$RS/r4.yml" -e FLEXGATE_SCRAPER_STATUS_FILE=/nonexistent/x/status.json
+  expect "scraper exit code ($SOUT)" "$SRC" "0"
+  contains "log" "$SOUT" "ERROR - Could not write the status file /nonexistent/x/status.json"
+  contains "log" "$SOUT" "Run finished"
+}
+
 # ---- run -----------------------------------------------------------------------------
 
 for c in bash cron python; do run_test "image has $c" t_has "$c"; done
@@ -786,6 +977,9 @@ run_test "entrypoint refuses to start with an empty settings file" t_entry_empty
 run_test "entrypoint refuses to start without a settings file" t_entry_missing_settings
 run_test "entrypoint refuses to start with settings the scraper user cannot read" t_entry_unreadable_settings
 run_test "entrypoint hands root-owned downloads to dockeruser once, logs the count" t_entry_repair
+run_test "status: healthcheck without a status file: grace after the start, unreadable file" t_status_none
+run_test "status: run ending with an unexpected exception writes ok false with the error" t_status_exception
+run_test "status: docker health of a fresh container is healthy (PID 1 start time)" t_status_docker_health
 
 fg_setup
 run_test "scraper refuses to run as root, exit 2, nothing downloaded" t_root_refused
@@ -796,16 +990,20 @@ run_test "decode: without a decoding block nothing is decoded" t_dec_absent
 
 dec_setup
 run_test "decode: first run decodes parameter sets first, then each .f2b, adds only decoded/" t_dec_first
+run_test "status: clean run writes status.json, ok true, counts, 30000 0644; healthy" t_status_clean
+run_test "status: unhealthy when the last run is older than the max age, grace after restart" t_status_age
 run_test "decode: CSV has the parameter set's header" t_dec_header
 run_test "decode: published files have mode 0644, no .tmp files left" t_dec_mode
 run_test "decode: comment_metadata with % comments metadata and repeated headers only" t_dec_comment_pct
 run_test "decode: second run calls the decoder for nothing" t_dec_second
 run_test "decode: missing parameter set gives an ERROR and no CSV" t_dec_missing_par
+run_test "status: decode failure gives ok false, decode_failed 1; unhealthy" t_status_decode_fail
 run_test "decode: published after the parameter set appears" t_dec_par_appears
 run_test "decode: exit 255, timeout and no output are ERRORs, other files decoded" t_dec_failures
 run_test "decode: post-processing disabled publishes the decoder output unchanged" t_dec_pp_off
 run_test "decode: comment_metadata with another comment character" t_dec_comment_hash
 run_test "decode: missing decoder gives one ERROR, downloads still happen" t_dec_no_decoder
+run_test "status: missing decoder gives ok false with decode_error; unhealthy" t_status_no_decoder
 run_test "settings: unknown post-processing step is rejected" t_bad_step
 run_test "settings: two-character comment_char is rejected" t_bad_char
 run_test "settings: whitespace comment_char is rejected" t_bad_space
@@ -815,11 +1013,14 @@ run_test "entrypoint refuses to start with invalid decoding settings" t_bad_entr
 
 rob_setup
 run_test "robust: HTTP 500 on one logger, next logger downloaded and decoded, exit 1" t_rob_http500
+run_test "status: failed source gives ok false with its name; unhealthy with the reason" t_status_failed_source
 run_test "robust: stalled server fails only that source after the timeout, exit 1" t_rob_stall
 run_test "robust: invalid timeout override is rejected, nothing downloaded" t_rob_bad_timeout
 run_test "robust: leftover .part files removed and downloaded again, none left" t_rob_partial
 run_test "robust: downloaded files have mode 0644 (also with umask 077)" t_rob_mode
 run_test "robust: second run while the lock is held exits 0 with a WARNING" t_rob_lock
+run_test "status: run skipped by the lock leaves the status file alone" t_status_lock
+run_test "status: unwritable status file logs an ERROR, exit code unchanged" t_status_write_fail
 run_test "user: files 30000:30000 0644, folders 0755, also with umask 077" t_rob_owner
 run_test "user: cron job (root, as-dockeruser, > /proc/1/fd/1) runs as 30000, output in the container log" t_cron_job
 

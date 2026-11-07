@@ -1,4 +1,5 @@
 import fcntl
+import json
 import os
 import requests
 from bs4 import BeautifulSoup
@@ -8,10 +9,12 @@ import sys
 import yaml
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import BaseModel, ValidationError, model_validator
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Union
 from urllib.parse import urlparse, urlunparse, urljoin, parse_qs, urlencode, quote
 
-from decoding import DecodingSettings, LoggerSource, logger_folder_name, run_decoding
+from decoding import DecodingSettings, LoggerSource, logger_folder_name, publish, run_decoding
+from healthcheck import STATUS_VERSION, format_time, status_file_path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -267,9 +270,20 @@ def scrape_source(source: Source, base_url: str, timeout: tuple) -> int:
     return downloaded
 
 
+def write_status(status: dict):
+    """Write the status file of this run atomically (mode 0644); healthcheck.py reads it.
+    A failure is logged and does not change the exit code."""
+    path = Path(status_file_path())
+    try:
+        publish(json.dumps(status, indent=2) + "\n", path)
+    except OSError as e:
+        logging.error(f"Could not write the status file {path}: {e}")
+
+
 def main() -> int:
     """One run: downloads for every source, then the decode step. Returns the exit code:
-    1 if any source failed, else 0 (decoding problems do not change it)."""
+    1 if any source failed, else 0 (decoding problems do not change it). Every run that takes
+    the run lock writes the status file at its end, also when it fails unexpectedly."""
     timeout = request_timeout()
     base_url = get_base_url(settings.flexgate_browse_url)
 
@@ -282,30 +296,54 @@ def main() -> int:
         logging.warning(f"Lock {LOCK_PATH} is held: another run is in progress, skipping this run.")
         return 0
 
-    # Iterate over each source in the settings; a failing source does not stop the others
+    started = datetime.now(timezone.utc)
     ok, failed, downloaded = 0, [], 0
-    for source in settings.sources:
-        name = logger_folder_name(source.serial, source.logger_name)
-        try:
-            downloaded += scrape_source(source, base_url, timeout)
-            ok += 1
-        except (requests.RequestException, OSError) as e:
-            logging.error(f"Source {name} failed, continuing with the next source: {type(e).__name__}: {e}")
-            failed.append(name)
+    totals = None
+    error = None
+    try:
+        # Iterate over each source in the settings; a failing source does not stop the others
+        for source in settings.sources:
+            name = logger_folder_name(source.serial, source.logger_name)
+            try:
+                downloaded += scrape_source(source, base_url, timeout)
+                ok += 1
+            except (requests.RequestException, OSError) as e:
+                logging.error(f"Source {name} failed, continuing with the next source: {type(e).__name__}: {e}")
+                failed.append(name)
 
-    if failed:
-        logging.warning(f"Downloads incomplete: {len(failed)} source(s) failed: {', '.join(failed)}")
-    else:
-        logging.info("All files downloaded successfully.")
+        if failed:
+            logging.warning(f"Downloads incomplete: {len(failed)} source(s) failed: {', '.join(failed)}")
+        else:
+            logging.info("All files downloaded successfully.")
 
-    # Decode step (only with an enabled "decoding" block in the settings), for all sources
-    run_decoding(settings.decoding, [
-        LoggerSource(serial=s.serial, logger_name=s.logger_name or "",
-                     folder=Path(settings.base_download_folder) / logger_folder_name(s.serial, s.logger_name))
-        for s in settings.sources])
+        # Decode step (only with an enabled "decoding" block in the settings), for all sources
+        totals = run_decoding(settings.decoding, [
+            LoggerSource(serial=s.serial, logger_name=s.logger_name or "",
+                         folder=Path(settings.base_download_folder) / logger_folder_name(s.serial, s.logger_name))
+            for s in settings.sources])
 
-    logging.info(f"Run finished: {ok} source(s) ok, {len(failed)} failed, {downloaded} file(s) downloaded.")
-    return 1 if failed else 0
+        logging.info(f"Run finished: {ok} source(s) ok, {len(failed)} failed, {downloaded} file(s) downloaded.")
+        return 1 if failed else 0
+    except BaseException as e:
+        error = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        decoded = totals.decoded if totals else 0
+        decode_failed = totals.failed if totals else 0
+        decode_error = totals.error if totals else None
+        write_status({
+            "version": STATUS_VERSION,
+            "started": format_time(started),
+            "finished": format_time(datetime.now(timezone.utc)),
+            "ok": not failed and not decode_failed and decode_error is None and error is None,
+            "sources_ok": ok,
+            "sources_failed": failed,
+            "files_downloaded": downloaded,
+            "files_decoded": decoded,
+            "decode_failed": decode_failed,
+            "decode_error": decode_error,
+            "error": error,
+        })
 
 
 if __name__ == "__main__":
