@@ -2,11 +2,14 @@ import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
 import logging
+import sys
 import yaml
-from pydantic_settings import BaseSettings
-from pydantic import BaseModel
-from typing import List, Dict, Union
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ValidationError, model_validator
+from typing import List, Dict, Optional, Union
 from urllib.parse import urlparse, urlunparse, urljoin, parse_qs, urlencode, quote
+
+from decoding import DecodingSettings, LoggerSource, logger_folder_name, run_decoding
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,9 +37,19 @@ class Settings(BaseSettings):
     base_download_folder: str
     sources: List[Source]
     downloadable_extensions: List[str]
+    # Optional decode step after the downloads (see decoding.py); absent = download only
+    decoding: Optional[DecodingSettings] = None
 
-    class Config:
-        env_file = ".env"
+    model_config = SettingsConfigDict(env_file=".env")
+
+    @model_validator(mode="after")
+    def _output_folder_not_a_source_folder(self):
+        if self.decoding is not None:
+            for source in self.sources:
+                if self.decoding.output_folder in source.get_folders_list():
+                    raise ValueError(f"decoding.output_folder '{self.decoding.output_folder}' is also "
+                                     f"a download folder of source {source.serial}")
+        return self
 
 
 # Get the directory of the current script
@@ -45,12 +58,21 @@ script_dir = Path(__file__).parent
 # Construct the path to the settings.yml file
 settings_path = script_dir / "settings.yml"
 
-# Load settings from YAML file
-with open(settings_path, "r") as file:
-    yaml_settings = yaml.safe_load(file)
-
-# Merge YAML settings with Pydantic Settings
-settings = Settings(**yaml_settings)
+# Load settings from YAML file and merge them with Pydantic Settings; refuse to run with
+# invalid settings. "flexgate_scraper.py --check-settings" only checks them (the entrypoint
+# does this before starting cron).
+try:
+    with open(settings_path, "r") as file:
+        yaml_settings = yaml.safe_load(file)
+    if not isinstance(yaml_settings, dict):
+        raise ValueError("the file does not contain a YAML mapping")
+    settings = Settings(**yaml_settings)
+except (OSError, yaml.YAMLError, ValueError, ValidationError) as e:
+    logging.error(f"Invalid settings in {settings_path}, not running: {e}")
+    sys.exit(2)
+if "--check-settings" in sys.argv[1:]:
+    print(f"Settings in {settings_path} are valid.")
+    sys.exit(0)
 
 # Function to download a file
 def download_file(file_url: str, output_path: Path):
@@ -93,7 +115,7 @@ for source in settings.sources:
     specific_files = source.get_files_list()
     
     logger_url = f"{settings.flexgate_browse_url}?dir=../data/{serial}"  
-    output_folder_name = f"{serial}_{logger_name}" if logger_name else serial
+    output_folder_name = logger_folder_name(serial, logger_name)
     base_output_folder = Path(f"{settings.base_download_folder}/{output_folder_name}")
     base_output_folder.mkdir(parents=True, exist_ok=True)
     
@@ -155,3 +177,10 @@ for source in settings.sources:
                 download_file(str(file_url), file_path)           
 
 logging.info("All files downloaded successfully.")
+
+# Decode step (only with an enabled "decoding" block in the settings)
+run_decoding(settings.decoding, [
+    LoggerSource(serial=s.serial, logger_name=s.logger_name or "",
+                 folder=Path(settings.base_download_folder) / logger_folder_name(s.serial, s.logger_name))
+    for s in settings.sources])
+

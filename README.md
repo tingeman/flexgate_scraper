@@ -7,6 +7,9 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 - Scrapes multiple sources from Flexgate using configurable serial numbers and logger names.
 - Downloads files with specific extensions or explicitly listed filenames.
 - Organizes downloads by source in a structured folder hierarchy.
+- Optionally decodes downloaded GeoPrecision data files (`.f2b`) to CSV files, with
+  GeoPrecision's decoder program (not included; see
+  [Decoding GeoPrecision data files](#decoding-geoprecision-data-files)).
 - Easily configurable via YAML settings.
 
 ## Project Structure
@@ -14,12 +17,11 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 ```
 .
 ├── app/
+│   ├── decoding.py
 │   ├── flexgate_scraper.py
 │   ├── requirements.in
 │   ├── requirements.txt
 │   └── settings.yml
-├── bin/
-│   └── decode3
 ├── config/
 │   ├── settings.yml
 │   └── cron_jobs/
@@ -29,11 +31,15 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 ├── entrypoint.sh
 ├── tests/
 │   ├── run.sh
-│   └── fake_flexgate.py
+│   ├── fake_flexgate.py
+│   └── stub_decode3.py
 ├── LICENSE
 ├── .gitattributes
 └── .gitignore
 ```
+
+`bin/` is ignored by git: it is the place for local vendor files, such as the decoder program,
+which are never committed.
 
 ## Configuration
 
@@ -43,6 +49,11 @@ Edit [`config/settings.yml`](config/settings.yml) to specify:
 - `base_download_folder`: Local folder for downloads.
 - `downloadable_extensions`: List of file extensions to download.
 - `sources`: List of sources with serial numbers, logger names, folders, and specific files.
+- `decoding` (optional): decode downloaded data files to CSV, see
+  [Decoding GeoPrecision data files](#decoding-geoprecision-data-files).
+
+Settings are checked when the container starts and at every run: unknown keys and invalid
+values stop the scraper with a message naming the setting.
 
 Example:
 ```yaml
@@ -87,6 +98,109 @@ thus overwriting any `settings.yml` file that may already exist there.
 
 When the scraper is run locally, it reads the config file `app/settings.yml`.
 
+
+## Decoding GeoPrecision data files
+
+Decoding is optional. Without a `decoding` block in the settings (or with `enabled: false`)
+the scraper only downloads files.
+
+Decoding needs GeoPrecision's decoder program `decode3` (Linux build). It is proprietary
+software: it is **not included** in this project and must **never be committed** to this or
+any other repository. **Contact GeoPrecision to obtain it.**
+
+### Building an image with the decoder
+
+Build the scraper image as usual, then add the decoder in a thin layer on top. Put the
+decoder file in a folder of its own (for example the git-ignored `bin/` of this repository,
+or any folder outside the repository) together with this `Dockerfile`:
+
+```dockerfile
+FROM flexgate_scraper:local
+COPY decode3 /opt/geoprecision/decode3
+RUN chmod 0755 /opt/geoprecision/decode3
+```
+
+and build with that folder as the build context, so only the decoder is sent to docker:
+
+```sh
+docker build -t flexgate_scraper:local .
+docker build -t flexgate_scraper:local-decoder bin/
+```
+
+`/opt/geoprecision/decode3` is the default `decoder_path`; any other path works if the
+settings name it. An image with the decoder contains proprietary software: keep it in
+private registries or local image stores only, never push it to a public registry.
+
+### Settings
+
+```yaml
+decoding:
+  enabled: true                            # false: download only, as without this block
+  decoder_path: /opt/geoprecision/decode3  # the decoder program inside the container
+  output_folder: decoded                   # subfolder of each logger folder for the CSV files
+  timeout_seconds: 60                      # per decoder call; a timeout counts as a failure
+  postprocessing:                          # optional; absent or enabled: false = publish
+    enabled: true                          #   the decoder's CSV unchanged
+    comment_char: "%"
+    steps:
+      - comment_metadata
+```
+
+- `enabled` (default `true`): `false` behaves exactly like an absent `decoding` block.
+- `decoder_path` (default `/opt/geoprecision/decode3`): path of the decoder in the container.
+- `output_folder` (default `decoded`): a plain folder name, created in each logger folder. It
+  must not be `raw`, `par` or one of the source's download folders.
+- `timeout_seconds` (default `60`): the longest a single decoder call may take.
+- `postprocessing.enabled` (default `true`), `postprocessing.comment_char` (default `%`,
+  exactly one non-whitespace character) and `postprocessing.steps` (list of step names, run
+  in list order; see below).
+
+Unknown keys and unknown step names are rejected when the settings are loaded.
+
+### Output
+
+After the downloads of each run, every `raw/<stem>.f2b` of a configured source that has no
+CSV yet is decoded and published as
+
+```
+<base_download_folder>/<serial>_<logger_name>/<output_folder>/<stem>.csv
+```
+
+(`<serial>/` without a logger name), with the base name of the raw file:
+`raw/D1022D_20261030020139.f2b` becomes `decoded/D1022D_20261030020139.csv`. A file is decoded
+once; to decode it again, delete its CSV.
+
+The decoder never runs on the downloaded files. Each run uses a temporary work folder in the
+container with its own decoder INI; the inputs are copied there and the folder is removed at
+the end of the run. A data file names the parameter set it was recorded with, so all
+`par/*.f2p` of the logger are decoded first, then the pending `.f2b` files. Nothing is
+written into the download folders except the output folder. A CSV is written as a hidden
+temporary file in the output folder first and then renamed (mode 0644), so tools that copy
+the folder never see a partial file.
+
+### Post-processing steps
+
+Each step gets the whole decoded file (all lines, with their line endings) and returns the
+whole new content, so a step can change, add, remove or reorder lines. Steps run in the order
+listed. A step is a function plus a name in the `STEPS` registry in `app/decoding.py`.
+
+- `comment_metadata`: puts `comment_char` in front of every line starting with `<` (the
+  decoder's metadata and messages, which also appear between data rows and at the end) and in
+  front of every repeated column header line (starting with `NO;TIME` or `NO,TIME`) after the
+  first one. All other lines stay byte for byte the same (values, delimiter, decimal comma,
+  line endings); no lines are added or removed. The result is a CSV that tools such as
+  `pandas.read_csv(..., sep=";", decimal=",", comment="%")` can read directly. Choose a
+  `comment_char` that does not occur at the start of a data line or the header.
+
+### Failures and retries
+
+A data file is decoded successfully only if the decoder exits with 0, writes the CSV and the
+CSV has no line starting with `<ERROR:` (for example when the parameter set is missing).
+Anything else, a timeout or a failing post-processing step is logged as an ERROR naming the
+file and the reason; nothing is published for that file and it is tried again in the next
+run. A missing or non-executable decoder gives one ERROR per run; the downloads still happen.
+A decoding failure never stops the downloads or the decoding of other files and loggers. Each
+logger with files to decode gets an INFO line with the number of decoded and failed files.
 
 ## Usage
 
@@ -147,8 +261,12 @@ syntax), the entrypoint (cron jobs installed with mode 0644, refusal to start wi
 settings) and the scraper itself: it is run against a local fake FlexGate server
 (`tests/fake_flexgate.py`) on a private `--internal` docker network, and the tests check
 where files land, that a second run downloads nothing and that a new file on the server is
-picked up. All other containers run with `--network none`, and all containers, the network
-and temporary folders are removed at the end. Each check prints `PASS:` or `FAIL:`, and the
+picked up. The decode step is tested with a stub
+decoder (`tests/stub_decode3.py`, which mimics the real decoder's file handling) installed in
+a docker volume: decode once, parameter sets first, missing parameter sets, failures and
+timeouts, post-processing, file modes, nothing written next to the downloaded files, and
+rejected settings. All other containers run with `--network none`, and all containers, the
+network, the volumes and temporary folders are removed at the end. Each check prints `PASS:` or `FAIL:`, and the
 run ends with `ALL <n> TESTS PASSED` (exit 0) or `<m> OF <n> TESTS FAILED` (exit 1).
 
 ## Scheduling

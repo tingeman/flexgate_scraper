@@ -8,6 +8,12 @@ if [ ! -s /app/settings.yml ]; then
     exit 1
 fi
 
+# Refuse to start with settings the scraper would reject (the error is printed above)
+if ! python /app/flexgate_scraper.py --check-settings; then
+    echo "Error: /app/settings.yml is invalid, see the message above."
+    exit 1
+fi
+
 # For debian based distros, the cron jobs may be in separate files
 # All cron files are copied to /etc/cron.d
 
@@ -16,9 +22,9 @@ for cron_file in /app/cron_jobs/*; do
     if [ -f "$cron_file" ]; then
         cp "$cron_file" /etc/cron.d
         # ensure the file has the correct permissions
-        chmod 0644 /etc/cron.d/$(basename "$cron_file")
+        chmod 0644 "/etc/cron.d/$(basename "$cron_file")"
         # ensure there is a blank line at the end of the file
-        echo "" >> /etc/cron.d/$(basename "$cron_file")
+        echo "" >> "/etc/cron.d/$(basename "$cron_file")"
     fi
 done
 echo "$(date '+%Y-%m-%d %H:%M:%S') - /etc/cron.d/ updated with custom cron jobs"

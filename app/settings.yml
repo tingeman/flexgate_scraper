@@ -44,3 +44,18 @@ sources:
       - "loggerinfo.dat"
       - "service.dat"
       - "state.dat"
+
+# Optional: decode downloaded GeoPrecision data files (raw/*.f2b) to CSV after each run.
+# Needs GeoPrecision's decoder program in the image (not included, see README.md,
+# "Decoding GeoPrecision data files"). Without this block (or with enabled: false) the
+# scraper only downloads. CSV files go to {logger folder}/{output_folder}/{raw file stem}.csv
+# decoding:
+#   enabled: true
+#   decoder_path: /opt/geoprecision/decode3   # decoder program inside the container
+#   output_folder: decoded                    # subfolder of each logger folder
+#   timeout_seconds: 60                       # per decoder call
+#   postprocessing:                           # optional; absent = decoder output unchanged
+#     enabled: true
+#     comment_char: "%"                       # exactly one non-whitespace character
+#     steps:
+#       - comment_metadata                    # comment out "<...>" lines and repeated headers
