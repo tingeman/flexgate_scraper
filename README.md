@@ -434,6 +434,24 @@ output in the container log, while a line without `as-dockeruser` logs the root 
 network, the volumes and temporary folders are removed at the end. Each check prints `PASS:` or `FAIL:`, and the
 run ends with `ALL <n> TESTS PASSED` (exit 0) or `<m> OF <n> TESTS FAILED` (exit 1).
 
+The full suite takes a few minutes. While working on a change, a part of it can be run:
+
+```sh
+TEST_FILTER='^decode:' bash tests/run.sh flexgate_scraper:local   # tests whose name matches
+bash tests/run.sh flexgate_scraper:local --quick                  # skip the slow tests
+```
+
+`TEST_FILTER` is an extended regular expression (`grep -E`) matched against the test names as
+printed after `PASS:`; only matching tests run. `--quick` (before or after the image) skips
+the tests marked slow, which wait for the next cron minute or for a timeout. Both can be
+combined. The fake server and the other setups run only when a selected test needs them.
+Tests in a group may rely on what earlier tests of the group left behind, so select a whole
+group (for example `^decode:` or `^top-level files:`) rather than a single later test.
+Skipped tests are counted in a `SKIPPED: <k> test(s)` line before the last line, `n` counts
+only the tests that ran, and a selection without any test is an error (exit 2). The full
+suite, without `TEST_FILTER` and without `--quick`, is what the image build runs, and it must
+pass before a commit.
+
 ## Scheduling
 
 To run the scraper periodically, use the cron job template in [`config/cron_jobs/cron_scrape_20m`](config/cron_jobs/cron_scrape_20m).

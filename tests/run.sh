@@ -14,12 +14,40 @@
 # inside a container). Nothing else is touched. Scraper runs happen as the scraper user
 # dockeruser (uid 30000), as in production; the image's process user stays root (cron).
 # Each check prints "PASS: <name>" or "FAIL: <name>: <reason>". The last line is
-# "ALL <n> TESTS PASSED" (exit 0) or "<m> OF <n> TESTS FAILED" (exit 1).
+# "ALL <n> TESTS PASSED" (exit 0) or "<m> OF <n> TESTS FAILED" (exit 1), where n counts the
+# tests that ran.
+#
+# Selecting tests, for quicker runs while working on a change:
+#
+#   TEST_FILTER='^decode:' bash tests/run.sh flexgate_scraper:local   # names matching (grep -E)
+#   bash tests/run.sh flexgate_scraper:local --quick                  # skip the slow tests
+#
+# TEST_FILTER is an extended regular expression matched against the test names (as printed
+# after "PASS: "); only matching tests run. --quick (before or after the image) skips the
+# tests marked slow (they wait for cron or for timeouts). Both can be combined. A setup (fake
+# server, decode volumes, ...) runs only if a selected test needs it. Tests in a group may
+# rely on what earlier tests of the group left behind, so a filter that picks a later test
+# alone can fail: select the whole group. Skipped tests are counted in a "SKIPPED: <k>
+# test(s)" line before the last line; a selection without any test is an error (exit 2).
+# The full suite (no TEST_FILTER, no --quick) is what the image build runs, and it must pass
+# before a commit.
 # shellcheck disable=SC2329  # test functions are called indirectly through run_test
 set -euo pipefail
 
-IMAGE="${1:-}"
-[ -n "$IMAGE" ] && [ $# -eq 1 ] || { echo "Usage: $0 <image>" >&2; exit 2; }
+usage() { echo "Usage: [TEST_FILTER=<regex>] $0 [--quick] <image>" >&2; exit 2; }
+IMAGE="" QUICK=0
+for a in "$@"; do
+  case "$a" in
+    --quick) QUICK=1 ;;
+    -*) usage ;;
+    *) [ -z "$IMAGE" ] || usage; IMAGE="$a" ;;
+  esac
+done
+[ -n "$IMAGE" ] || usage
+TEST_FILTER="${TEST_FILTER:-}"
+# grep exits 2 on an invalid expression
+rc=0; printf '' | grep -Eq -- "$TEST_FILTER" || rc=$?
+[ "$rc" -le 1 ] || { echo "invalid TEST_FILTER: $TEST_FILTER" >&2; exit 2; }
 command -v docker >/dev/null || { echo "docker not found" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image not found: $IMAGE" >&2; exit 2; }
 
@@ -222,11 +250,10 @@ t_entry_repair() {
 # ---- downloads against a fake FlexGate server ----------------------------------------
 # One server and one download directory shared by the download tests, which run in order.
 
-FG_OK=0 DL_E=""
+FG_OK=0 DL_E="$T/download"
 
 fg_setup() {
   TESTNAME="fakefg"
-  DL_E="$T/download"
   local d="$DL_E/srv/fg2lite/data"
   mkdir -p "$DL_E/srv/fg2lite/sw" "$d/A0001A/raw" "$d/A0001A/par" "$d/B0002B/raw" "$DL_E/downloads" "$DL_E/srv_code"
   cp "$TESTS_DIR/fake_flexgate.py" "$DL_E/srv_code/"
@@ -372,6 +399,18 @@ dec_cfg() {
   } > "$f"
 }
 
+# Settings files of the decode tests. No server needed: the settings tests use them alone.
+decsettings_setup() {
+  DS="$DL_E/dec"
+  mkdir -p "$DS"
+  dec_cfg "$DS/s1.yml" /stub/decode3 60 % C0003C:SITE-03
+  dec_cfg "$DS/s2.yml" /stub/decode3 60 % C0003C:SITE-03 D0004D
+  dec_cfg "$DS/s3.yml" /stub/decode3 3 off E0005E
+  dec_cfg "$DS/s4.yml" /stub/decode3 60 '#' F0006F
+  dec_cfg "$DS/s5.yml" /opt/nothere/decode3 60 % G0007G
+}
+
+# Server data and docker volumes (downloads, stub decoder) of the decode tests
 dec_setup() {
   TESTNAME="decsetup"
   local d="$DL_E/srv/fg2lite/data" s
@@ -396,14 +435,6 @@ dec_setup() {
   printf '%s\n' 'STUB:noout' 'PARSET E0005E_P1.f2p' '1;x;1' > "$d/E0005E/raw/E0005E_d.f2b"
   # G0007G: downloaded while the decoder is missing
   printf '%s\n' 'PARSET G0007G_P1.f2p' '1;x;1' > "$d/G0007G/raw/G0007G_001.f2b"
-
-  DS="$DL_E/dec"
-  mkdir -p "$DS"
-  dec_cfg "$DS/s1.yml" /stub/decode3 60 % C0003C:SITE-03
-  dec_cfg "$DS/s2.yml" /stub/decode3 60 % C0003C:SITE-03 D0004D
-  dec_cfg "$DS/s3.yml" /stub/decode3 3 off E0005E
-  dec_cfg "$DS/s4.yml" /stub/decode3 60 '#' F0006F
-  dec_cfg "$DS/s5.yml" /opt/nothere/decode3 60 % G0007G
 
   [ "$FG_OK" -eq 1 ] || return 0
   docker volume create "$DECVOL" >/dev/null 2>&1 || return 0
@@ -1044,69 +1075,120 @@ t_status_write_fail() {
 }
 
 # ---- run -----------------------------------------------------------------------------
+# The tests are registered first, then the selected ones run in this order.
+#   needs <setup>              the tests registered after it need <setup>_setup ("" for none)
+#   add_test [--slow] <name> <function> [args...]   (--quick skips --slow tests)
+# A setup runs once, just before the first selected test that needs it, after the setups it
+# depends on (setup_deps). Setups that no selected test needs do not run.
 
-for c in bash cron python; do run_test "image has $c" t_has "$c"; done
-for c in sudo curl wget git nano unzip rsync; do run_test "image lacks $c" t_lacks "$c"; done
-run_test "image pip check passes" t_pip_check
-run_test "image python packages import" t_python_imports
-run_test "image scripts have valid syntax and the entrypoint is executable" t_syntax
-run_test "image has user dockeruser 30000:30000 owning the data folders, process user root" t_user
+setup_deps() {   # setup_deps <setup>: the setups that must run before it
+  case "$1" in
+    dec) echo "fg decsettings" ;;   # server data and settings files
+    rob) echo "fg dec" ;;           # server data; the robustness tests use the decode volumes
+  esac
+}
 
-run_test "entrypoint with settings keeps running and installs cron jobs" t_entry_ok
-run_test "entrypoint refuses to start with an empty settings file" t_entry_empty_settings
-run_test "entrypoint refuses to start without a settings file" t_entry_missing_settings
-run_test "entrypoint refuses to start with settings the scraper user cannot read" t_entry_unreadable_settings
-run_test "entrypoint hands root-owned downloads to dockeruser once, logs the count" t_entry_repair
-run_test "status: healthcheck without a status file: grace after the start, unreadable file" t_status_none
-run_test "status: run ending with an unexpected exception writes ok false with the error" t_status_exception
-run_test "status: docker health of a fresh container is healthy (PID 1 start time)" t_status_docker_health
+T_NAMES=() T_CMDS=() T_NEEDS=() T_SLOW=() NEED=""
+needs() { NEED="$1"; }
+add_test() {
+  local slow=0
+  if [ "$1" = --slow ]; then slow=1; shift; fi
+  T_NAMES+=("$1") T_CMDS+=("${*:2}") T_NEEDS+=("$NEED") T_SLOW+=("$slow")
+}
 
-fg_setup
-run_test "scraper refuses to run as root, exit 2, nothing downloaded" t_root_refused
-run_test "scraper downloads listed files and folders into <serial>_<logger_name>/<folder>" t_dl_first
-run_test "scraper second run downloads nothing and logs no skips at INFO" t_dl_second
-run_test "scraper downloads a file that appeared on the server" t_dl_new_file
-run_test "decode: without a decoding block nothing is decoded" t_dec_absent
+SETUPS_DONE=" "
+run_setup() {   # run_setup <setup>: once, after its dependencies
+  local dep
+  case "$SETUPS_DONE" in *" $1 "*) return 0 ;; esac
+  for dep in $(setup_deps "$1"); do run_setup "$dep"; done
+  "${1}_setup"
+  SETUPS_DONE="$SETUPS_DONE$1 "
+}
 
-dec_setup
-run_test "decode: first run decodes parameter sets first, then each .f2b, adds only decoded/" t_dec_first
-run_test "status: clean run writes status.json, ok true, counts, 30000 0644; healthy" t_status_clean
-run_test "status: unhealthy when the last run is older than the max age, grace after restart" t_status_age
-run_test "decode: CSV has the parameter set's header" t_dec_header
-run_test "decode: published files have mode 0644, no .tmp files left" t_dec_mode
-run_test "decode: comment_metadata with % comments metadata and repeated headers only" t_dec_comment_pct
-run_test "decode: second run calls the decoder for nothing" t_dec_second
-run_test "decode: missing parameter set gives an ERROR and no CSV" t_dec_missing_par
-run_test "status: decode failure gives ok false, decode_failed 1; unhealthy" t_status_decode_fail
-run_test "decode: published after the parameter set appears" t_dec_par_appears
-run_test "decode: exit 255, timeout and no output are ERRORs, other files decoded" t_dec_failures
-run_test "decode: post-processing disabled publishes the decoder output unchanged" t_dec_pp_off
-run_test "decode: comment_metadata with another comment character" t_dec_comment_hash
-run_test "decode: missing decoder gives one ERROR, downloads still happen" t_dec_no_decoder
-run_test "status: missing decoder gives ok false with decode_error; unhealthy" t_status_no_decoder
-run_test "settings: unknown post-processing step is rejected" t_bad_step
-run_test "settings: two-character comment_char is rejected" t_bad_char
-run_test "settings: whitespace comment_char is rejected" t_bad_space
-run_test "settings: unknown key in decoding is rejected" t_bad_key
-run_test "settings: unknown key in postprocessing is rejected" t_bad_pp_key
-run_test "entrypoint refuses to start with invalid decoding settings" t_bad_entry
+needs ""
 
-rob_setup
-run_test "robust: HTTP 500 on one logger, next logger downloaded and decoded, exit 1" t_rob_http500
-run_test "status: failed source gives ok false with its name; unhealthy with the reason" t_status_failed_source
-run_test "robust: stalled server fails only that source after the timeout, exit 1" t_rob_stall
-run_test "robust: invalid timeout override is rejected, nothing downloaded" t_rob_bad_timeout
-run_test "robust: leftover .part files removed and downloaded again, none left" t_rob_partial
-run_test "robust: downloaded files have mode 0644 (also with umask 077)" t_rob_mode
-run_test "robust: second run while the lock is held exits 0 with a WARNING" t_rob_lock
-run_test "status: run skipped by the lock leaves the status file alone" t_status_lock
-run_test "status: unwritable status file logs an ERROR, exit code unchanged" t_status_write_fail
-run_test "user: files 30000:30000 0644, folders 0755, also with umask 077" t_rob_owner
-run_test "top-level files: changed content replaces the file (30000 0644), counted as downloaded" t_top_changed
-run_test "top-level files: unchanged content fetched again, file untouched (mtime), 0 downloaded" t_top_unchanged
-run_test "top-level files: failed refresh (file or listing HTTP error) keeps the old file, exit 1" t_top_fail
-run_test "user: cron job (root, as-dockeruser, > /proc/1/fd/1) runs as 30000, output in the container log" t_cron_job
+for c in bash cron python; do add_test "image has $c" t_has "$c"; done
+for c in sudo curl wget git nano unzip rsync; do add_test "image lacks $c" t_lacks "$c"; done
+add_test "image pip check passes" t_pip_check
+add_test "image python packages import" t_python_imports
+add_test "image scripts have valid syntax and the entrypoint is executable" t_syntax
+add_test "image has user dockeruser 30000:30000 owning the data folders, process user root" t_user
 
+add_test "entrypoint with settings keeps running and installs cron jobs" t_entry_ok
+add_test "entrypoint refuses to start with an empty settings file" t_entry_empty_settings
+add_test "entrypoint refuses to start without a settings file" t_entry_missing_settings
+add_test "entrypoint refuses to start with settings the scraper user cannot read" t_entry_unreadable_settings
+add_test "entrypoint hands root-owned downloads to dockeruser once, logs the count" t_entry_repair
+add_test "status: healthcheck without a status file: grace after the start, unreadable file" t_status_none
+add_test "status: run ending with an unexpected exception writes ok false with the error" t_status_exception
+add_test "status: docker health of a fresh container is healthy (PID 1 start time)" t_status_docker_health
+
+needs fg
+add_test "scraper refuses to run as root, exit 2, nothing downloaded" t_root_refused
+add_test "scraper downloads listed files and folders into <serial>_<logger_name>/<folder>" t_dl_first
+add_test "scraper second run downloads nothing and logs no skips at INFO" t_dl_second
+add_test "scraper downloads a file that appeared on the server" t_dl_new_file
+add_test "decode: without a decoding block nothing is decoded" t_dec_absent
+
+needs dec
+add_test "decode: first run decodes parameter sets first, then each .f2b, adds only decoded/" t_dec_first
+add_test "status: clean run writes status.json, ok true, counts, 30000 0644; healthy" t_status_clean
+add_test "status: unhealthy when the last run is older than the max age, grace after restart" t_status_age
+add_test "decode: CSV has the parameter set's header" t_dec_header
+add_test "decode: published files have mode 0644, no .tmp files left" t_dec_mode
+add_test "decode: comment_metadata with % comments metadata and repeated headers only" t_dec_comment_pct
+add_test "decode: second run calls the decoder for nothing" t_dec_second
+add_test "decode: missing parameter set gives an ERROR and no CSV" t_dec_missing_par
+add_test "status: decode failure gives ok false, decode_failed 1; unhealthy" t_status_decode_fail
+add_test "decode: published after the parameter set appears" t_dec_par_appears
+add_test "decode: exit 255, timeout and no output are ERRORs, other files decoded" t_dec_failures
+add_test "decode: post-processing disabled publishes the decoder output unchanged" t_dec_pp_off
+add_test "decode: comment_metadata with another comment character" t_dec_comment_hash
+add_test "decode: missing decoder gives one ERROR, downloads still happen" t_dec_no_decoder
+add_test "status: missing decoder gives ok false with decode_error; unhealthy" t_status_no_decoder
+
+needs decsettings
+add_test "settings: unknown post-processing step is rejected" t_bad_step
+add_test "settings: two-character comment_char is rejected" t_bad_char
+add_test "settings: whitespace comment_char is rejected" t_bad_space
+add_test "settings: unknown key in decoding is rejected" t_bad_key
+add_test "settings: unknown key in postprocessing is rejected" t_bad_pp_key
+add_test "entrypoint refuses to start with invalid decoding settings" t_bad_entry
+
+needs rob
+add_test "robust: HTTP 500 on one logger, next logger downloaded and decoded, exit 1" t_rob_http500
+add_test "status: failed source gives ok false with its name; unhealthy with the reason" t_status_failed_source
+add_test "robust: stalled server fails only that source after the timeout, exit 1" t_rob_stall
+add_test "robust: invalid timeout override is rejected, nothing downloaded" t_rob_bad_timeout
+add_test "robust: leftover .part files removed and downloaded again, none left" t_rob_partial
+add_test "robust: downloaded files have mode 0644 (also with umask 077)" t_rob_mode
+add_test "robust: second run while the lock is held exits 0 with a WARNING" t_rob_lock
+add_test "status: run skipped by the lock leaves the status file alone" t_status_lock
+add_test "status: unwritable status file logs an ERROR, exit code unchanged" t_status_write_fail
+add_test "user: files 30000:30000 0644, folders 0755, also with umask 077" t_rob_owner
+add_test "top-level files: changed content replaces the file (30000 0644), counted as downloaded" t_top_changed
+add_test "top-level files: unchanged content fetched again, file untouched (mtime), 0 downloaded" t_top_unchanged
+add_test "top-level files: failed refresh (file or listing HTTP error) keeps the old file, exit 1" t_top_fail
+add_test --slow "user: cron job (root, as-dockeruser, > /proc/1/fd/1) runs as 30000, output in the container log" t_cron_job
+
+SELECTED=() SKIPPED=0
+for i in "${!T_NAMES[@]}"; do
+  if { [ -n "$TEST_FILTER" ] && ! printf '%s\n' "${T_NAMES[i]}" | grep -Eq -- "$TEST_FILTER"; } ||
+     { [ "$QUICK" -eq 1 ] && [ "${T_SLOW[i]}" -eq 1 ]; }; then
+    SKIPPED=$((SKIPPED + 1))
+  else
+    SELECTED+=("$i")
+  fi
+done
+[ "${#SELECTED[@]}" -gt 0 ] || { echo "no test selected (TEST_FILTER='$TEST_FILTER', quick=$QUICK)" >&2; exit 2; }
+
+for i in "${SELECTED[@]}"; do
+  [ -z "${T_NEEDS[i]}" ] || run_setup "${T_NEEDS[i]}"
+  read -ra cmd <<< "${T_CMDS[i]}"   # function and arguments; the arguments have no spaces
+  run_test "${T_NAMES[i]}" "${cmd[@]}"
+done
+
+[ "$SKIPPED" -eq 0 ] || echo "SKIPPED: $SKIPPED test(s) (filter/quick)"
 TOTAL=$((PASSED + FAILED))
 if [ "$FAILED" -eq 0 ]; then
   echo "ALL $TOTAL TESTS PASSED"
