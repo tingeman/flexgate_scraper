@@ -60,15 +60,6 @@ class Settings(BaseSettings):
 # Never run as root: everything the scraper writes must belong to the scraper user (the
 # entrypoint runs as root only to start cron and repair ownership). Also for --check-settings.
 SCRAPER_USER = os.environ.get("FLEXGATE_SCRAPER_USER") or "dockeruser"
-if os.geteuid() == 0:
-    logging.error(f"Refusing to run as root: run the scraper as the scraper user {SCRAPER_USER}, e.g. "
-                  f"docker exec -u {SCRAPER_USER} flexgate_scraper python /app/flexgate_scraper.py")
-    sys.exit(2)
-
-# Folders and files the scraper creates get mode 0755/0644 whatever umask it was started
-# with (also intermediate folders from mkdir(parents=True), which an explicit chmod after
-# each mkdir would miss); downloads and published CSVs also set 0644 explicitly.
-os.umask(0o022)
 
 # Get the directory of the current script
 script_dir = Path(__file__).parent
@@ -76,21 +67,20 @@ script_dir = Path(__file__).parent
 # Construct the path to the settings.yml file
 settings_path = script_dir / "settings.yml"
 
-# Load settings from YAML file and merge them with Pydantic Settings; refuse to run with
-# invalid settings. "flexgate_scraper.py --check-settings" only checks them (the entrypoint
-# does this before starting cron).
-try:
-    with open(settings_path, "r") as file:
+# The settings of this run: set by cli() from settings_path before main() runs (tests set it
+# directly). Importing this module loads nothing and checks nothing.
+settings: Optional[Settings] = None
+
+
+def load_settings(path) -> Settings:
+    """Settings from a YAML file. Raises OSError, yaml.YAMLError, ValueError or
+    ValidationError (a ValueError) when the file cannot be read or the settings are invalid."""
+    with open(path, "r") as file:
         yaml_settings = yaml.safe_load(file)
     if not isinstance(yaml_settings, dict):
         raise ValueError("the file does not contain a YAML mapping")
-    settings = Settings(**yaml_settings)
-except (OSError, yaml.YAMLError, ValueError, ValidationError) as e:
-    logging.error(f"Invalid settings in {settings_path}, not running: {e}")
-    sys.exit(2)
-if "--check-settings" in sys.argv[1:]:
-    print(f"Settings in {settings_path} are valid.")
-    sys.exit(0)
+    return Settings(**yaml_settings)
+
 
 # Network timeouts of every request in seconds, (connect, read). The read timeout is the
 # longest wait for the next data from the server, not for the whole download.
@@ -307,6 +297,10 @@ def main() -> int:
     """One run: downloads for every source, then the decode step. Returns the exit code:
     1 if any source failed, else 0 (decoding problems do not change it). Every run that takes
     the run lock writes the status file at its end, also when it fails unexpectedly."""
+    # Folders and files the scraper creates get mode 0755/0644 whatever umask it was started
+    # with (also intermediate folders from mkdir(parents=True), which an explicit chmod after
+    # each mkdir would miss); downloads and published CSVs also set 0644 explicitly.
+    os.umask(0o022)
     timeout = request_timeout()
     base_url = get_base_url(settings.flexgate_browse_url)
 
@@ -367,7 +361,29 @@ def main() -> int:
             "decode_error": decode_error,
             "error": error,
         })
+        # Release the run lock (it would also go with the process; tests call main() repeatedly)
+        os.close(lock_fd)
+
+
+def cli(argv) -> int:
+    """The command line: refuse root (exit 2), load and check the settings (exit 2 when
+    invalid), then "--check-settings" only reports them as valid (exit 0, the entrypoint does
+    this before starting cron); otherwise one run, see main()."""
+    global settings
+    if os.geteuid() == 0:
+        logging.error(f"Refusing to run as root: run the scraper as the scraper user {SCRAPER_USER}, e.g. "
+                      f"docker exec -u {SCRAPER_USER} flexgate_scraper python /app/flexgate_scraper.py")
+        return 2
+    try:
+        settings = load_settings(settings_path)
+    except (OSError, yaml.YAMLError, ValueError, ValidationError) as e:
+        logging.error(f"Invalid settings in {settings_path}, not running: {e}")
+        return 2
+    if "--check-settings" in argv:
+        print(f"Settings in {settings_path} are valid.")
+        return 0
+    return main()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli(sys.argv[1:]))

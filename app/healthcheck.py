@@ -13,8 +13,8 @@ during those N minutes either; its ``ok`` still counts. So compose needs no ``st
 
 The scraper (flexgate_scraper.py) writes the status file at the end of every run, see
 ``write_status``. Standard library only; runs as any user, also root (docker runs the
-healthcheck as the image's process user). It must not import flexgate_scraper.py, which loads
-and checks the settings at import.
+healthcheck as the image's process user). It does not import flexgate_scraper.py, so it
+works without valid settings and without the scraper's dependencies.
 """
 import argparse
 import json

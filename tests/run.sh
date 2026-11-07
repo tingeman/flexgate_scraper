@@ -1,36 +1,57 @@
 #!/bin/bash
-# Behaviour tests of the flexgate_scraper image. Run on the workstation with the docker CLI
-# against a built image, from the repository root:
+# Tests of the flexgate_scraper image. Run on the workstation with the docker CLI against a
+# built image, from the repository root:
 #
 #   bash tests/run.sh flexgate_scraper:local
 #
 # Works under bash on Linux and WSL, and from Git Bash on Windows (Docker Desktop).
-# Every container runs with --network none, except the download and decode tests: those run
-# the scraper against a local fake FlexGate server (tests/fake_flexgate.py) on a private
-# --internal docker network, so nothing leaves the workstation. The decode tests use a stub
-# decoder (tests/stub_decode3.py), never the real one. All containers have names starting
-# with a unique prefix and are removed at the end, together with the network, three docker
-# volumes and the temporary directories (files that containers created there are deleted from
-# inside a container). Nothing else is touched. Scraper runs happen as the scraper user
-# dockeruser (uid 30000), as in production; the image's process user stays root (cron).
-# Each check prints "PASS: <name>" or "FAIL: <name>: <reason>". The last line is
+# Two layers:
+#
+# * unit tests (tests/unit/test_*.py, names "unit: <module>: <description>"): the scraper's
+#   logic (settings, downloads, top-level files, failing and stalling sources, partial
+#   downloads, modes, run lock, status file, healthcheck, decoding with the stub decoder
+#   tests/stub_decode3.py), tested in-process with the standard library's unittest against
+#   the fake FlexGate server (tests/fake_flexgate.py) on 127.0.0.1. All of them run in ONE
+#   container of the image (--network none, as the scraper user) through
+#   tests/unit/run_unit.py, which prints one PASS/FAIL line per unit test.
+# * container tests (all other names): what needs a real container: the image contents, the
+#   entrypoint, the root refusal, one end-to-end path as dockeruser against the fake server
+#   in its own container on a private --internal docker network, the docker healthcheck and a
+#   cron job. Checks that can share a container do.
+#
+# Nothing leaves the workstation; the real decoder is never used. All containers have names
+# starting with a unique prefix and are removed at the end, together with the network, the
+# docker volume and the temporary directory. Nothing else is touched. Scraper runs happen as
+# the scraper user dockeruser (uid 30000), as in production; the image's process user stays
+# root (cron). Each test prints "PASS: <name>" or "FAIL: <name>: <reason>". The last line is
 # "ALL <n> TESTS PASSED" (exit 0) or "<m> OF <n> TESTS FAILED" (exit 1), where n counts the
-# tests that ran.
+# tests that ran, unit tests included.
 #
 # Selecting tests, for quicker runs while working on a change:
 #
-#   TEST_FILTER='^decode:' bash tests/run.sh flexgate_scraper:local   # names matching (grep -E)
-#   bash tests/run.sh flexgate_scraper:local --quick                  # skip the slow tests
+#   TEST_FILTER='^unit:' bash tests/run.sh flexgate_scraper:local       # only the unit tests
+#   TEST_FILTER='^entrypoint' bash tests/run.sh flexgate_scraper:local  # names matching (grep -E)
+#   bash tests/run.sh flexgate_scraper:local --quick                    # skip the slow tests
 #
 # TEST_FILTER is an extended regular expression matched against the test names (as printed
 # after "PASS: "); only matching tests run. --quick (before or after the image) skips the
-# tests marked slow (they wait for cron or for timeouts). Both can be combined. A setup (fake
-# server, decode volumes, ...) runs only if a selected test needs it. Tests in a group may
-# rely on what earlier tests of the group left behind, so a filter that picks a later test
-# alone can fail: select the whole group. Skipped tests are counted in a "SKIPPED: <k>
-# test(s)" line before the last line; a selection without any test is an error (exit 2).
-# The full suite (no TEST_FILTER, no --quick) is what the image build runs, and it must pass
+# tests marked slow (the cron job test, which waits for the next cron minute). Both can be
+# combined. A setup (fake server, shared containers) runs only if a selected test needs it,
+# and the unit test container only if a unit test is selected. Every test sets up what it
+# needs, so any single test can be selected. Skipped tests are counted in a "SKIPPED: <k>
+# test(s)" line before the last line; a selection without any test is an error (exit 2). The
+# full suite (no TEST_FILTER, no --quick) is what the image build runs, and it must pass
 # before a commit.
+#
+# One unit test module directly, while iterating (from the repository root; under Git Bash
+# set MSYS_NO_PATHCONV=1 and use "$(cygpath -m "$PWD")" for "$PWD"):
+#
+#   docker run --rm --network none --user dockeruser -e PYTHONDONTWRITEBYTECODE=1 \
+#     -v "$PWD/tests:/tests:ro" -w /tests/unit --entrypoint python flexgate_scraper:local \
+#     -m unittest -v test_download            # or test_download.DownloadTest.test_stall
+#
+# Adding -e FLEXGATE_APP_DIR=/appsrc -v "$PWD/app:/appsrc:ro" tests the app code of the
+# checkout instead of the image's, without rebuilding.
 # shellcheck disable=SC2329  # test functions are called indirectly through run_test
 set -euo pipefail
 
@@ -52,7 +73,9 @@ command -v docker >/dev/null || { echo "docker not found" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image not found: $IMAGE" >&2; exit 2; }
 
 TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
-[ -f "$TESTS_DIR/fake_flexgate.py" ] || { echo "missing $TESTS_DIR/fake_flexgate.py" >&2; exit 2; }
+for f in fake_flexgate.py stub_decode3.py unit/run_unit.py; do
+  [ -f "$TESTS_DIR/$f" ] || { echo "missing $TESTS_DIR/$f" >&2; exit 2; }
+done
 
 # Git Bash: keep container paths (/app/...) as they are, and give docker Windows paths for
 # the host side of bind mounts (see hp below).
@@ -60,7 +83,7 @@ export MSYS_NO_PATHCONV=1
 
 PFX="flexgate-test-$$"
 NET="$PFX-net"
-DECVOL="$PFX-dec" STUBVOL="$PFX-stub" REPVOL="$PFX-rep"
+REPVOL="$PFX-rep"
 SU=dockeruser   # the scraper user
 T="$(mktemp -d "${TMPDIR:-/tmp}/flexgate-test.XXXXXX")"
 
@@ -75,12 +98,9 @@ cleanup() {
   # shellcheck disable=SC2086  # word splitting of the id list is intended
   [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
-  docker volume rm "$DECVOL" "$STUBVOL" "$REPVOL" >/dev/null 2>&1 || true
-  if [ -d "$T" ]; then
-    # containers wrote as root or uid 30000: delete from inside a container, then remove what is left
-    docker run --rm --network none --entrypoint sh -v "$(hp "$T"):/t" "$IMAGE" -c 'find /t -mindepth 1 -delete' >/dev/null 2>&1 || true
-    rm -rf "$T" 2>/dev/null || echo "WARNING: could not remove $T" >&2
-  fi
+  docker volume rm "$REPVOL" >/dev/null 2>&1 || true
+  # containers only read $T (read-only bind mounts): the files are the workstation user's
+  [ ! -d "$T" ] || rm -rf "$T" 2>/dev/null || echo "WARNING: could not remove $T" >&2
   exit "$rc"
 }
 trap cleanup EXIT
@@ -96,26 +116,37 @@ lacks() { case "$2" in *"$3"*) fail_t "$1: output contains [$3]: $2" ;; esac; }
 cname() { echo "$PFX-$TESTNAME${1:+-$1}"; }
 sorted() { LC_ALL=C sort; }
 
-# Plain container for image-content checks
-plain() { docker run --rm --network none --entrypoint sh "$IMAGE" -c "$1"; }
-
-# Entries under a directory as "<type> <path>", listed by a container (files written by
-# containers are owned by root).
-listing() {
-  docker run --rm --network none --entrypoint find -v "$(hp "$1"):/t:ro" -w /t "$IMAGE" . -mindepth 1 -printf '%y %P\n' | sorted
-}
-
 wait_until() {   # wait_until <tries> <cmd...>: run cmd every 0.5 s until it succeeds
   local n=$1; shift
   while [ "$n" -gt 0 ]; do "$@" >/dev/null 2>&1 && return 0; sleep 0.5; n=$((n - 1)); done
   return 1
 }
 
+# Several checks share one container: its script runs commands with emit (EMIT), which
+# prints "<key>.rc <exit code>" and "<key>.out <line>" for every line of the command's
+# output. The setup stores them with facts <group> <output> in F: F[<group>.<key>.rc] is the
+# exit code, F[<group>.<key>.out] the output lines; the tests read F directly (no subshells:
+# forks are slow under Git Bash). F[<group>] holds the whole output, for error messages.
+EMIT='emit() { k=$1; shift; o="$("$@" 2>&1)"; r=$?; echo "$k.rc $r"; [ -z "$o" ] || printf "%s\n" "$o" | sed "s/^/$k.out /"; }'
+declare -A F=()
+facts() {   # facts <group> <output>
+  local line k v
+  F[$1]="$2"
+  while IFS= read -r line; do
+    k="$1.${line%% *}" v="${line#* }"
+    [ "$line" != "${line%% *}" ] || v=""
+    case "$k" in
+      *.out) F[$k]="${F[$k]:+${F[$k]}$'\n'}$v" ;;
+      *) F[$k]="$v" ;;
+    esac
+  done <<< "$2"
+}
+
 PASSED=0 FAILED=0
 run_test() {   # run_test <name> <function> [args...]
   local name="$1" fn="$2"; shift 2
   local out rc=0
-  TESTNAME="$(printf '%s' "$name" | tr -c 'A-Za-z0-9\n' '-' | cut -c1-40)"
+  TESTNAME="${name//[^A-Za-z0-9]/-}" TESTNAME="${TESTNAME:0:40}"
   out="$($fn "$@" 2>&1)" || rc=$?
   if [ "$rc" -eq 0 ]; then
     PASSED=$((PASSED + 1)); echo "PASS: $name"
@@ -134,38 +165,6 @@ mkenv() {
   printf '%s\n' 'SHELL=/bin/sh' '20 * * * * root /usr/local/bin/as-dockeruser /usr/local/bin/python /app/flexgate_scraper.py > /proc/1/fd/1 2>&1' > "$E/cron/cron_test"
 }
 
-# ---- image contents ------------------------------------------------------------------
-
-t_has()   { plain "command -v $1" >/dev/null || fail_t "$1 is missing"; }
-t_lacks() { ! plain "command -v $1" >/dev/null 2>&1 || fail_t "$1 is present"; }
-
-t_pip_check() {
-  docker run --rm --network none --entrypoint python "$IMAGE" -m pip check 2>&1 || fail_t "pip check failed"
-}
-
-t_python_imports() {
-  docker run --rm --network none --entrypoint python "$IMAGE" -c \
-    'import requests, bs4, pydantic, pydantic_settings, yaml' 2>&1 || fail_t "import failed"
-}
-
-t_syntax() {
-  plain "bash -n /entrypoint.sh" 2>&1 || fail_t "syntax error in /entrypoint.sh"
-  plain "test -x /entrypoint.sh" || fail_t "/entrypoint.sh is not executable"
-  docker run --rm --network none --entrypoint python "$IMAGE" -c \
-    'import ast; ast.parse(open("/app/flexgate_scraper.py").read())' 2>&1 || fail_t "syntax error in flexgate_scraper.py"
-}
-
-t_user() {
-  expect "id $SU" "$(plain "id $SU")" "uid=30000(dockeruser) gid=30000(dockeruser) groups=30000(dockeruser)"
-  expect "folders" "$(plain 'stat -c "%u:%g %a %n" /app/downloads /var/lib/flexgate_scraper')" \
-    "$(printf '%s\n' '30000:30000 755 /app/downloads' '30000:30000 755 /var/lib/flexgate_scraper')"
-  expect "image process user (cron needs root)" "$(docker image inspect -f '{{.Config.User}}' "$IMAGE")" ""
-  plain 'test ! -e /etc/sudoers && test ! -e /etc/sudoers.d' || fail_t "sudoers configuration present"
-  expect "as-dockeruser" "$(plain '/usr/local/bin/as-dockeruser id')" "uid=30000(dockeruser) gid=30000(dockeruser) groups=30000(dockeruser)"
-}
-
-# ---- entrypoint ----------------------------------------------------------------------
-
 # Start the entrypoint in the background: start_entry <name> [docker run arguments...];
 # waits until the cron jobs are installed
 start_entry() {
@@ -176,338 +175,246 @@ start_entry() {
   wait_until 40 sh -c "docker logs '$name' 2>&1 | grep -q 'cron.d/ updated'" || fail_t "entrypoint did not finish: $(docker logs "$name" 2>&1 | tail -n 5)"
 }
 
-t_entry_ok() {
+# ---- unit tests ----------------------------------------------------------------------
+
+# Names of the unit tests, read from the test files: "unit: <module>: <docstring>", the
+# names run_unit.py prints (it reports a test without a one-line docstring as failed)
+unit_names() {
+  local f m
+  for f in "$TESTS_DIR"/unit/test_*.py; do
+    m="${f##*/test_}" m="${m%.py}"
+    sed -n '/^    def test_/{n;s/^ *"""\(.*\)"""$/unit: '"$m"': \1/p}' "$f"
+  done
+}
+
+# The selected unit tests in one container; counts and prints their PASS/FAIL lines. A
+# selected test without a result line counts as failed.
+run_unit() {   # run_unit <name>...
+  local out rc=0 line name nl=$'\n'
+  out="$(docker run --rm --network none --user "$SU" --name "$PFX-unit" -e PYTHONDONTWRITEBYTECODE=1 \
+    -v "$(hp "$TESTS_DIR"):/tests:ro" --entrypoint python "$IMAGE" /tests/unit/run_unit.py "$@" 2>&1)" || rc=$?
+  while IFS= read -r line; do
+    case "$line" in
+      "PASS: "*) PASSED=$((PASSED + 1)); echo "$line" ;;
+      "FAIL: "*) FAILED=$((FAILED + 1)); echo "$line" ;;
+      "    "*) echo "$line" ;;
+    esac
+  done <<< "$out"
+  for name in "$@"; do
+    case "$nl$out$nl" in
+      *"${nl}PASS: $name$nl"* | *"${nl}FAIL: $name: "*) ;;
+      *) FAILED=$((FAILED + 1))
+         echo "FAIL: $name: no result from the unit test container (exit code $rc)"
+         printf '%s\n' "$out" | tail -n 5 | sed 's/^/    /' ;;
+    esac
+  done
+}
+
+# ---- image contents ------------------------------------------------------------------
+# One container (as the image's process user, root) collects everything; the tests check
+# their part of its output (F[img.*]).
+
+img_setup() {
+  facts img "$(docker run --rm --network none --name "$PFX-img" --entrypoint sh "$IMAGE" -c "$EMIT"'
+    for c in bash cron python sudo curl wget git nano unzip rsync; do emit "cmd_$c" command -v "$c"; done
+    emit pipcheck python -m pip check
+    emit imports python -c "import requests, bs4, pydantic, pydantic_settings, yaml"
+    emit bash_n bash -n /entrypoint.sh
+    emit entry_x test -x /entrypoint.sh
+    for f in flexgate_scraper healthcheck decoding; do
+      emit "py_$f" python -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "/app/$f.py"
+    done
+    emit id id dockeruser
+    emit folders stat -c "%u:%g %a %n" /app/downloads /var/lib/flexgate_scraper
+    emit sudoers sh -c "test ! -e /etc/sudoers && test ! -e /etc/sudoers.d"
+    emit as_user /usr/local/bin/as-dockeruser id
+    emit root_run python /app/flexgate_scraper.py
+    emit root_check python /app/flexgate_scraper.py --check-settings
+    emit root_written find /app/downloads /var/lib/flexgate_scraper -mindepth 1
+  ' 2>&1)" || true
+}
+need_img() { [ -n "${F[img.id.rc]:-}" ] || fail_t "the image check container did not run: ${F[img]:-}"; }
+
+t_has() { need_img; expect "command -v $1" "${F[img.cmd_$1.rc]:-}" "0"; }
+t_lacks() { need_img; [ "${F[img.cmd_$1.rc]:-}" != 0 ] || fail_t "$1 is present: ${F[img.cmd_$1.out]:-}"; }
+t_pip_check() { need_img; expect "pip check (${F[img.pipcheck.out]:-})" "${F[img.pipcheck.rc]:-}" "0"; }
+t_python_imports() { need_img; expect "imports (${F[img.imports.out]:-})" "${F[img.imports.rc]:-}" "0"; }
+
+t_syntax() {
+  need_img
+  expect "bash -n /entrypoint.sh (${F[img.bash_n.out]:-})" "${F[img.bash_n.rc]:-}" "0"
+  expect "/entrypoint.sh executable" "${F[img.entry_x.rc]:-}" "0"
+  local f
+  for f in flexgate_scraper healthcheck decoding; do
+    expect "syntax of $f.py (${F[img.py_$f.out]:-})" "${F[img.py_$f.rc]:-}" "0"
+  done
+}
+
+t_user() {
+  need_img
+  expect "id $SU" "${F[img.id.out]:-}" "uid=30000(dockeruser) gid=30000(dockeruser) groups=30000(dockeruser)"
+  expect "folders" "${F[img.folders.out]:-}" \
+    "$(printf '%s\n' '30000:30000 755 /app/downloads' '30000:30000 755 /var/lib/flexgate_scraper')"
+  expect "image process user (cron needs root)" "$(docker image inspect -f '{{.Config.User}}' "$IMAGE")" ""
+  expect "sudoers configuration absent" "${F[img.sudoers.rc]:-}" "0"
+  expect "as-dockeruser" "${F[img.as_user.out]:-}" "uid=30000(dockeruser) gid=30000(dockeruser) groups=30000(dockeruser)"
+}
+
+# A run as root exits 2 with the message and writes nothing; also --check-settings
+t_root_refused() {
+  need_img
+  local k out
+  for k in root_run root_check; do
+    out="${F[img.$k.out]:-}"
+    expect "exit code ($k)" "${F[img.$k.rc]:-}" "2"
+    contains "log ($k)" "$out" "ERROR - Refusing to run as root: run the scraper as the scraper user dockeruser, e.g. docker exec -u dockeruser flexgate_scraper python /app/flexgate_scraper.py"
+    lacks "log ($k)" "$out" "Downloading"
+    lacks "log ($k)" "$out" "are valid"
+  done
+  expect "files written by the root runs" "${F[img.root_written.out]:-}" ""
+}
+
+# ---- entrypoint ----------------------------------------------------------------------
+
+# One entrypoint container with valid settings and a docker healthcheck: it keeps running,
+# installs the cron jobs and becomes healthy in the grace period (real start time of PID 1),
+# also for docker exec as the scraper user; the settings check at the start writes no status
+# file. Facts in F[ent.*].
+entry_setup() {
+  TESTNAME="entry"
   mkenv entry_ok
-  local name running mode cronfile out
+  local name
   name="$(cname)"
-  start_entry "$name" --network none
-  sleep 2
-  running="$(docker inspect -f '{{.State.Running}}' "$name")"
-  mode="$(docker exec "$name" stat -c '%a %U' /etc/cron.d/cron_test)"
-  cronfile="$(docker exec "$name" cat /etc/cron.d/cron_test)"
-  out="$(docker logs "$name" 2>&1)"
-  docker rm -f "$name" >/dev/null
-  expect "container running" "$running" "true"
-  expect "cron file mode and owner" "$mode" "644 root"
-  contains "cron file" "$cronfile" "/app/flexgate_scraper.py"
-  lacks "log" "$out" "WARNING"
-  lacks "log" "$out" "owner of"
+  facts ent "$( (
+    start_entry "$name" --network none --health-cmd "python /app/healthcheck.py --max-age-minutes 130" \
+      --health-interval 2s --health-retries 1
+    wait_until 40 sh -c "docker inspect -f '{{.State.Health.Status}}' '$name' | grep -qx healthy" || true
+    echo "running.out $(docker inspect -f '{{.State.Running}}' "$name")"
+    echo "health.out $(docker inspect -f '{{.State.Health.Status}}' "$name")"
+    docker inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' "$name" | sed 's/^/healthlog.out /'
+    docker exec "$name" sh -c "$EMIT"'
+      emit cronmode stat -c "%a %U" /etc/cron.d/cron_test
+      emit cronfile cat /etc/cron.d/cron_test
+      emit state ls -A /var/lib/flexgate_scraper'
+    docker exec -u "$SU" "$name" sh -c "$EMIT"'; emit hc python /app/healthcheck.py'
+    docker logs "$name" 2>&1 | sed 's/^/log.out /'
+  ) 2>&1)"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+}
+need_ent() { [ -n "${F[ent.running.out]:-}" ] || fail_t "the entrypoint container did not start: ${F[ent]:-}"; }
+
+t_entry_ok() {
+  need_ent
+  expect "container running" "${F[ent.running.out]:-}" "true"
+  expect "cron file mode and owner" "${F[ent.cronmode.out]:-}" "644 root"
+  contains "cron file" "${F[ent.cronfile.out]:-}" "/app/flexgate_scraper.py"
+  lacks "log" "${F[ent.log.out]:-}" "WARNING"
+  lacks "log" "${F[ent.log.out]:-}" "owner of"
 }
 
-# Entrypoint that must refuse to start: exit non-zero with the message, no cron file
-# installed. entry_must_fail <message> <docker run arguments...> (e.g. --entrypoint, image)
-entry_must_fail() {
-  local msg="$1" name out rc=0 changes
+t_docker_health() {
+  need_ent
+  expect "health status" "${F[ent.health.out]:-}" "healthy"
+  contains "health log" "${F[ent.healthlog.out]:-}" "healthy: no run yet, container started 0 min ago (grace 130 min)"
+  expect "/var/lib/flexgate_scraper after the settings check" "${F[ent.state.out]:-}" ""
+  expect "healthcheck by docker exec as $SU: exit code" "${F[ent.hc.rc]:-}" "0"
+  contains "healthcheck by docker exec as $SU" "${F[ent.hc.out]:-}" "healthy: no run yet, container started 0 min ago"
+}
+
+# The entrypoint refusing to start, four times in one container (each time: exit non-zero
+# with the message, no cron file installed): empty settings file, no settings file (the image
+# ships a template, so it is removed), settings the scraper user cannot read, invalid
+# decoding settings. Facts in F[ref.*].
+refuse_setup() {
+  mkenv refuse
+  mkdir -p "$E/cfg"
+  cp "$E/settings.yml" "$E/cfg/valid.yml"
+  { cat "$E/settings.yml"
+    printf '%s\n' 'decoding:' '  enabled: true' '  decoder_path: /stub/decode3' '  postprocessing:' \
+      '    enabled: true' '    comment_char: "%"' '    steps: [frobnicate]'
+  } > "$E/cfg/bad.yml"
+  facts ref "$(docker run --rm --network none --name "$PFX-refuse" -v "$(hp "$E/cron"):/app/cron_jobs:ro" \
+    -v "$(hp "$E/cfg"):/cfg:ro" --entrypoint bash "$IMAGE" -c '
+    try() {
+      timeout 30 /entrypoint.sh > /tmp/o 2>&1; echo "$1.rc $?"; sed "s/^/$1.out /" /tmp/o
+      if [ -e /etc/cron.d/cron_test ]; then echo "$1.cron yes"; rm -f /etc/cron.d/cron_test; else echo "$1.cron no"; fi
+    }
+    : > /app/settings.yml; try empty
+    rm -f /app/settings.yml; try missing
+    cp /cfg/valid.yml /app/settings.yml; chmod 0600 /app/settings.yml; try unreadable
+    cp /cfg/bad.yml /app/settings.yml; chmod 0644 /app/settings.yml; try baddec
+  ' 2>&1)" || true
+}
+entry_refused() {   # entry_refused <key> <message>...
+  local k="$1" m
   shift
-  name="$(cname)"
-  out="$(docker run --network none --name "$name" -v "$(hp "$E/cron"):/app/cron_jobs:ro" "$@" 2>&1)" || rc=$?
-  changes="$(docker diff "$name" || true)"
-  docker rm -f "$name" >/dev/null
-  [ "$rc" -ne 0 ] || fail_t "exit code 0, expected non-zero: $out"
-  case "$changes" in *"/etc/cron.d/cron_test"*) fail_t "a cron file was installed" ;; esac
-  contains "log" "$out" "$msg"
+  [ -n "${F[ref.$k.rc]:-}" ] || fail_t "no result from the entrypoint container: ${F[ref]:-}"
+  [ "${F[ref.$k.rc]:-}" != 0 ] || fail_t "exit code 0, expected non-zero: ${F[ref.$k.out]:-}"
+  expect "cron file installed" "${F[ref.$k.cron]:-}" "no"
+  for m in "$@"; do contains "log" "${F[ref.$k.out]:-}" "$m"; done
 }
-
-t_entry_empty_settings() {
-  mkenv entry_empty
-  : > "$E/settings.yml"
-  entry_must_fail "/app/settings.yml is missing or empty" -v "$(hp "$E/settings.yml"):/app/settings.yml:ro" "$IMAGE"
-}
-
-# The image ships a template app/settings.yml, so "missing" is tested by removing it first
-t_entry_missing_settings() {
-  mkenv entry_missing
-  entry_must_fail "/app/settings.yml is missing or empty" --entrypoint bash "$IMAGE" -c 'rm -f /app/settings.yml && exec /entrypoint.sh'
-}
-
-t_entry_unreadable_settings() {
-  mkenv entry_unreadable
-  entry_must_fail "/app/settings.yml is not readable by the scraper user dockeruser" \
-    --entrypoint bash "$IMAGE" -c 'chmod 0600 /app/settings.yml && exec /entrypoint.sh'
-}
+t_entry_empty_settings() { entry_refused empty "/app/settings.yml is missing or empty"; }
+t_entry_missing_settings() { entry_refused missing "/app/settings.yml is missing or empty"; }
+t_entry_unreadable_settings() { entry_refused unreadable "/app/settings.yml is not readable by the scraper user dockeruser"; }
+t_entry_bad_decoding() { entry_refused baddec "unknown post-processing step(s) ['frobnicate']" "/app/settings.yml is invalid"; }
 
 # A volume with files and folders from a version that ran as root: the first start hands
-# them all to the scraper user and logs the count, a second start changes nothing
+# them all to the scraper user and logs the count, a restart changes nothing
+n_started() { docker logs "$1" 2>&1 | grep -c 'cron.d/ updated' || true; }
 t_entry_repair() {
   mkenv entry_repair
-  docker run --rm --network none -v "$REPVOL:/app/downloads" --entrypoint sh "$IMAGE" -c '
-    cd /app/downloads && chown root:root . && mkdir -p X0001X/raw && echo a > X0001X/raw/a.f2p &&
-    echo b > X0001X/log.txt && chown 30000:root X0001X/log.txt' || fail_t "could not fill the volume"
-  local out1 out2 left
-  start_entry "$(cname 1)" --network none -v "$REPVOL:/app/downloads"
-  out1="$(docker logs "$(cname 1)" 2>&1)"
-  docker rm -f "$(cname 1)" >/dev/null
-  left="$(docker run --rm --network none -v "$REPVOL:/d:ro" --entrypoint find "$IMAGE" /d \( ! -user 30000 -o ! -group 30000 \) -print)"
-  start_entry "$(cname 2)" --network none -v "$REPVOL:/app/downloads"
-  out2="$(docker logs "$(cname 2)" 2>&1)"
-  docker rm -f "$(cname 2)" >/dev/null
-  contains "first start" "$out1" "/app/downloads: owner of 5 entries changed to dockeruser:dockeruser"
+  local name out left
+  name="$(cname)"
+  docker run -d --name "$name" --network none -v "$REPVOL:/app/downloads" -v "$(hp "$E/settings.yml"):/app/settings.yml:ro" \
+    -v "$(hp "$E/cron"):/app/cron_jobs:ro" --entrypoint bash "$IMAGE" -c '
+    [ -e /root/.filled ] || { cd /app/downloads && chown root:root . && mkdir -p X0001X/raw && echo a > X0001X/raw/a.f2p &&
+      echo b > X0001X/log.txt && chown 30000:root X0001X/log.txt && touch /root/.filled; } || exit 9
+    exec /entrypoint.sh' >/dev/null || fail_t "could not start"
+  wait_until 40 sh -c "[ \"\$(docker logs '$name' 2>&1 | grep -c 'cron.d/ updated')\" -ge 1 ]" || fail_t "first start did not finish: $(docker logs "$name" 2>&1 | tail -n 5)"
+  left="$(docker exec "$name" find /app/downloads \( ! -user 30000 -o ! -group 30000 \) -print)"
+  docker restart -t 0 "$name" >/dev/null || fail_t "could not restart"
+  wait_until 40 sh -c "[ \"\$(docker logs '$name' 2>&1 | grep -c 'cron.d/ updated')\" -ge 2 ]" || fail_t "restart did not finish: $(docker logs "$name" 2>&1 | tail -n 5)"
+  out="$(docker logs "$name" 2>&1)"
+  docker rm -f "$name" >/dev/null
+  contains "first start" "$out" "/app/downloads: owner of 5 entries changed to dockeruser:dockeruser"
   expect "entries not owned by 30000:30000" "$left" ""
-  lacks "second start" "$out2" "owner of"
-  lacks "second start" "$out2" "WARNING"
+  expect "ownership changes logged (first start and restart)" "$(printf '%s\n' "$out" | grep -c 'owner of' || true)" "1"
+  lacks "log" "$out" "WARNING"
 }
 
-# ---- downloads against a fake FlexGate server ----------------------------------------
-# One server and one download directory shared by the download tests, which run in order.
+# ---- fake FlexGate server on a docker network ----------------------------------------
+# One server container, reachable as "flexgate" on a private --internal network, for the
+# end-to-end runs and the cron job.
 
-FG_OK=0 DL_E="$T/download"
-
+FG_OK=0 SRV="$T/srv"
 fg_setup() {
   TESTNAME="fakefg"
-  local d="$DL_E/srv/fg2lite/data"
-  mkdir -p "$DL_E/srv/fg2lite/sw" "$d/A0001A/raw" "$d/A0001A/par" "$d/B0002B/raw" "$DL_E/downloads" "$DL_E/srv_code"
-  cp "$TESTS_DIR/fake_flexgate.py" "$DL_E/srv_code/"
+  local d="$SRV/fg2lite/data"
+  mkdir -p "$SRV/fg2lite/sw" "$d/A0001A/raw" "$d/A0001A/par" "$d/O0015O/raw" "$T/srv_code"
+  cp "$TESTS_DIR/fake_flexgate.py" "$T/srv_code/"
+  # A0001A: a top-level file, a file that is not listed in the settings, a parameter set and
+  # a data file with metadata and a repeated header
   printf 'log\n' > "$d/A0001A/log.txt"
-  printf 'state\n' > "$d/A0001A/state.dat"
   printf 'not listed\n' > "$d/A0001A/other.txt"
-  printf 'raw one\n' > "$d/A0001A/raw/x1.f2p"
-  printf 'raw two\n' > "$d/A0001A/raw/x2.f2b"
-  printf 'a,b\n' > "$d/A0001A/raw/notes.csv"
-  printf 'par\n' > "$d/A0001A/par/p.par"
-  printf 'other logger\n' > "$d/B0002B/raw/y1.f2p"
-  cat > "$DL_E/settings.yml" <<'YML'
-flexgate_browse_url: "http://flexgate:8080/fg2lite/sw/browse.php"
-base_download_folder: "/app/downloads"
-downloadable_extensions:
-  - ".f2p"
-  - ".f2b"
-  - ".par"
-sources:
-  - serial: "A0001A"
-    logger_name: "SITE-01"
-    folders:
-      - raw
-      - par
-    files:
-      - "log.txt"
-      - "state.dat"
-  - serial: "B0002B"
-    folders: raw
-YML
+  printf 'NO;TIME;#1(oC);#2(oC)\n' > "$d/A0001A/par/A0001A_P1.f2p"
+  printf '%s\n' 'PARSET A0001A_P1.f2p' '<READOUT>' '1;28.10.2026 16:00:10;-10,87;-9,25' \
+    'NO;TIME;#1(oC);#2(oC)' '2;28.10.2026 17:00:10;-10,92;-9,3' > "$d/A0001A/raw/A0001A_001.f2b"
+  # O0015O: downloaded by the cron job
+  printf 'o raw\n' > "$d/O0015O/raw/o1.f2p"
   docker network create --internal "$NET" >/dev/null 2>&1 || return 0
   docker run -d --network "$NET" --network-alias flexgate --name "$(cname srv)" \
-    -v "$(hp "$DL_E/srv"):/srv:ro" -v "$(hp "$DL_E/srv_code"):/code:ro" \
+    -v "$(hp "$SRV"):/srv:ro" -v "$(hp "$T/srv_code"):/code:ro" \
     --entrypoint python "$IMAGE" -u /code/fake_flexgate.py /srv 8080 >/dev/null 2>&1 || return 0
   wait_until 40 sh -c "docker logs '$(cname srv)' 2>&1 | grep -q 'listening'" && FG_OK=1
   return 0
 }
 
-# One scraper run (python directly, as the cron job does); sets SOUT and SRC
-scrape() {
-  [ "$FG_OK" -eq 1 ] || fail_t "the fake FlexGate server did not start"
-  SRC=0
-  SOUT="$(docker run --rm --network "$NET" --name "$PFX-fg-run-$RANDOM" --user "$SU" \
-    -v "$(hp "$DL_E/settings.yml"):/app/settings.yml:ro" -v "$(hp "$DL_E/downloads"):/app/downloads" \
-    --entrypoint python "$IMAGE" /app/flexgate_scraper.py 2>&1)" || SRC=$?
-}
-n_downloads() { printf '%s\n' "$1" | grep -c 'Downloading ' || true; }
+# ---- end to end ----------------------------------------------------------------------
+# One container as dockeruser with umask 077 and the stub decoder: two scraper runs (python
+# directly, as the cron job does) against the fake server, then the healthcheck. Facts in
+# F[e2e.*].
 
-# A run as root exits 2 with the message and writes nothing; also --check-settings
-t_root_refused() {
-  [ "$FG_OK" -eq 1 ] || fail_t "the fake FlexGate server did not start"
-  local d="$T/rootrun" out rc arg
-  mkdir -p "$d"
-  for arg in "" --check-settings; do
-    rc=0
-    # shellcheck disable=SC2086  # no argument at all when arg is empty
-    out="$(docker run --rm --network "$NET" --name "$(cname)" \
-      -v "$(hp "$DL_E/settings.yml"):/app/settings.yml:ro" -v "$(hp "$d"):/app/downloads" \
-      --entrypoint python "$IMAGE" /app/flexgate_scraper.py $arg 2>&1)" || rc=$?
-    expect "exit code ($arg)" "$rc" "2"
-    contains "log ($arg)" "$out" "ERROR - Refusing to run as root: run the scraper as the scraper user dockeruser, e.g. docker exec -u dockeruser flexgate_scraper python /app/flexgate_scraper.py"
-    lacks "log ($arg)" "$out" "Downloading"
-    lacks "log ($arg)" "$out" "are valid"
-  done
-  expect "downloaded entries" "$(listing "$d")" ""
-}
-
-t_dl_first() {
-  scrape
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  contains "output" "$SOUT" "All files downloaded successfully."
-  expect "downloaded entries" "$(listing "$DL_E/downloads")" "$(printf '%s\n' \
-    'd A0001A_SITE-01' 'f A0001A_SITE-01/log.txt' 'f A0001A_SITE-01/state.dat' \
-    'd A0001A_SITE-01/raw' 'f A0001A_SITE-01/raw/x1.f2p' 'f A0001A_SITE-01/raw/x2.f2b' \
-    'd A0001A_SITE-01/par' 'f A0001A_SITE-01/par/p.par' \
-    'd B0002B' 'd B0002B/raw' 'f B0002B/raw/y1.f2p' | sorted)"
-  expect "number of downloads" "$(n_downloads "$SOUT")" "6"
-  expect "content of raw/x1.f2p" "$(cat "$DL_E/downloads/A0001A_SITE-01/raw/x1.f2p")" "raw one"
-  expect "content of log.txt" "$(cat "$DL_E/downloads/A0001A_SITE-01/log.txt")" "log"
-}
-
-t_dl_second() {
-  local before
-  before="$(listing "$DL_E/downloads")"
-  scrape
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "number of downloads" "$(n_downloads "$SOUT")" "0"
-  lacks "output at INFO level" "$SOUT" "Skipping"
-  expect "downloaded entries" "$(listing "$DL_E/downloads")" "$before"
-}
-
-t_dl_new_file() {
-  printf 'raw three\n' > "$DL_E/srv/fg2lite/data/A0001A/raw/x3.f2p"
-  scrape
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "number of downloads" "$(n_downloads "$SOUT")" "1"
-  contains "output" "$SOUT" "data/A0001A/raw/x3.f2p"
-  expect "content of raw/x3.f2p" "$(cat "$DL_E/downloads/A0001A_SITE-01/raw/x3.f2p")" "raw three"
-}
-
-# ---- decoding (stub decoder) ---------------------------------------------------------
-# The decode tests share the fake FlexGate server. Downloads go to a docker volume ($DECVOL,
-# so file modes are real on every platform) and tests/stub_decode3.py is installed as
-# /stub/decode3 in a second volume ($STUBVOL), together with the stub's call logs and the
-# copies of the CSVs it wrote (/stub/keep). Settings use decoder_path /stub/decode3, which
-# also hides any real decoder in the image. The tests run in order.
-
-DEC_OK=0 DS=""
-
-# Shell in a container with both volumes: downloads at /d, stub at /stub (as the scraper user)
-vsh() { docker run --rm --network none --user "$SU" --entrypoint sh -v "$DECVOL:/d" -v "$STUBVOL:/stub" "$IMAGE" -c "$1"; }
-
-# Settings for the decode tests:
-#   dec_cfg <file> <decoder_path> <timeout_seconds> <comment_char|off> <source>...
-# source is SERIAL or SERIAL:LOGGER_NAME; "off" disables post-processing.
-dec_cfg() {
-  local f="$1" dp="$2" to="$3" pp="$4" s
-  shift 4
-  {
-    echo 'flexgate_browse_url: "http://flexgate:8080/fg2lite/sw/browse.php"'
-    echo 'base_download_folder: "/app/downloads"'
-    echo 'downloadable_extensions: [".f2p", ".f2b"]'
-    echo 'sources:'
-    for s in "$@"; do
-      echo "  - serial: \"${s%%:*}\""
-      [ "$s" = "${s%%:*}" ] || echo "    logger_name: \"${s#*:}\""
-      echo '    folders: [raw, par]'
-    done
-    echo 'decoding:'
-    echo '  enabled: true'
-    echo "  decoder_path: $dp"
-    echo '  output_folder: decoded'
-    echo "  timeout_seconds: $to"
-    echo '  postprocessing:'
-    if [ "$pp" = off ]; then
-      echo '    enabled: false'
-      echo '    comment_char: "%"'
-    else
-      echo '    enabled: true'
-      echo "    comment_char: \"$pp\""
-    fi
-    echo '    steps: [comment_metadata]'
-  } > "$f"
-}
-
-# Settings files of the decode tests. No server needed: the settings tests use them alone.
-decsettings_setup() {
-  DS="$DL_E/dec"
-  mkdir -p "$DS"
-  dec_cfg "$DS/s1.yml" /stub/decode3 60 % C0003C:SITE-03
-  dec_cfg "$DS/s2.yml" /stub/decode3 60 % C0003C:SITE-03 D0004D
-  dec_cfg "$DS/s3.yml" /stub/decode3 3 off E0005E
-  dec_cfg "$DS/s4.yml" /stub/decode3 60 '#' F0006F
-  dec_cfg "$DS/s5.yml" /opt/nothere/decode3 60 % G0007G
-}
-
-# Server data and docker volumes (downloads, stub decoder) of the decode tests
-dec_setup() {
-  TESTNAME="decsetup"
-  local d="$DL_E/srv/fg2lite/data" s
-  for s in C0003C D0004D E0005E F0006F G0007G; do mkdir -p "$d/$s/raw" "$d/$s/par"; done
-  # C0003C: a parameter set and two data files, one with metadata between the rows and a
-  # repeated header. F0006F: the same data under another serial.
-  printf 'NO;TIME;#1(oC);#2(oC);HK-BAT(V)\n' > "$d/C0003C/par/C0003C_P1.f2p"
-  printf '%s\n' 'PARSET C0003C_P1.f2p' '<READOUT>' "<HK-INFO: 'Server OK'>" \
-    '1;28.10.2026 16:00:10;-10,87;-9,25;6,400' '2;28.10.2026 17:00:10;-10,92;-9,3' \
-    '<READOUT>' "<HK-INFO: 'Server Timeout'>" 'NO;TIME;#1(oC);#2(oC);HK-BAT(V)' \
-    '3;28.10.2026 18:00:10;-11;-9,37' > "$d/C0003C/raw/C0003C_001.f2b"
-  printf '%s\n' 'PARSET C0003C_P1.f2p' '4;28.10.2026 19:00:10;-11,1;-9,4;6,398' > "$d/C0003C/raw/C0003C_002.f2b"
-  sed 's/C0003C/F0006F/g' "$d/C0003C/par/C0003C_P1.f2p" > "$d/F0006F/par/F0006F_P1.f2p"
-  sed 's/C0003C/F0006F/g' "$d/C0003C/raw/C0003C_001.f2b" > "$d/F0006F/raw/F0006F_001.f2b"
-  # D0004D: data file whose parameter set is not on the server (yet)
-  printf '%s\n' 'PARSET D0004D_P1.f2p' '1;28.10.2026 16:00:10;-1,5;-2,5' > "$d/D0004D/raw/D0004D_001.f2b"
-  # E0005E: exit 255, timeout, a good file, exit 0 without output
-  printf 'NO;TIME;#1(oC)\n' > "$d/E0005E/par/E0005E_P1.f2p"
-  printf '%s\n' 'STUB:exit255' 'PARSET E0005E_P1.f2p' '1;x;1' > "$d/E0005E/raw/E0005E_a.f2b"
-  printf '%s\n' 'STUB:sleep 30' 'PARSET E0005E_P1.f2p' '1;x;1' > "$d/E0005E/raw/E0005E_b.f2b"
-  printf '%s\n' 'PARSET E0005E_P1.f2p' '<READOUT>' '1;28.10.2026 16:00:10;-3,25' > "$d/E0005E/raw/E0005E_c.f2b"
-  printf '%s\n' 'STUB:noout' 'PARSET E0005E_P1.f2p' '1;x;1' > "$d/E0005E/raw/E0005E_d.f2b"
-  # G0007G: downloaded while the decoder is missing
-  printf '%s\n' 'PARSET G0007G_P1.f2p' '1;x;1' > "$d/G0007G/raw/G0007G_001.f2b"
-
-  [ "$FG_OK" -eq 1 ] || return 0
-  docker volume create "$DECVOL" >/dev/null 2>&1 || return 0
-  docker volume create "$STUBVOL" >/dev/null 2>&1 || return 0
-  docker run --rm --network none --entrypoint sh -v "$STUBVOL:/stub" -v "$(hp "$TESTS_DIR"):/src:ro" "$IMAGE" \
-    -c 'cp /src/stub_decode3.py /stub/decode3 && chmod 0755 /stub/decode3 && mkdir -p /stub/keep /stub/status && chown -R 30000:30000 /stub' >/dev/null 2>&1 || return 0
-  DEC_OK=1
-}
-
-# One scraper run with the decode volumes; sets SOUT, SRC and DCALLS (the inputs the stub
-# was called with, one per line, in order). Fails if anything is left in /tmp after the run
-# (the decoder work folder must be removed, also after errors; the run lock file stays) or
-# anything but status.json in /var/lib/flexgate_scraper. The run's status file is copied to
-# /stub/status/last.json and its "<uid>:<gid> <mode>" to /stub/status/last.meta ("none"
-# without a status file), for the status and healthcheck tests.
-#   dscrape <settings file> [docker run arguments...]
-# -e SCRAPE_UMASK=<umask> runs the scraper with that umask (default 022).
-dscrape() {
-  [ "$DEC_OK" -eq 1 ] || fail_t "the decode test setup failed"
-  local calls="/stub/calls-$TESTNAME-$RANDOM.log" settings="$1"
-  shift
-  SRC=0
-  SOUT="$(docker run --rm --network "$NET" --name "$PFX-dec-run-$RANDOM" --user "$SU" \
-    -v "$(hp "$settings"):/app/settings.yml:ro" -v "$DECVOL:/app/downloads" -v "$STUBVOL:/stub" \
-    -e STUB_DECODE3_CALLS="$calls" -e STUB_DECODE3_KEEP=/stub/keep "$@" \
-    --entrypoint sh "$IMAGE" -c 'rm -f /stub/status/last.json /stub/status/last.meta
-      umask "${SCRAPE_UMASK:-022}"; python /app/flexgate_scraper.py; rc=$?
-      ls -A /tmp | grep -vx flexgate_scraper.lock | sed "s/^/TMPLEFT /"
-      ls -A /var/lib/flexgate_scraper | grep -vx status.json | sed "s/^/STATELEFT /"
-      st=/var/lib/flexgate_scraper/status.json
-      if [ -e $st ]; then cp $st /stub/status/last.json; stat -c "%u:%g %a" $st > /stub/status/last.meta
-      else echo none > /stub/status/last.meta; fi
-      exit $rc' 2>&1)" || SRC=$?
-  lacks "work folder left in /tmp" "$SOUT" "TMPLEFT"
-  lacks "files left in /var/lib/flexgate_scraper" "$SOUT" "STATELEFT"
-  DCALLS="$(vsh "cat $calls 2>/dev/null; true")"
-}
-dlisting() { vsh "cd /d/$1 && find . -mindepth 1 -printf '%y %P\n'" | sorted; }
-
-# Checks a published CSV against the stub's CSV after comment_metadata:
-#   python -c "$CHECK_COMMENTED" <stub csv> <published csv> <comment_char>
-CHECK_COMMENTED='
-import sys
-a = open(sys.argv[1], "rb").read().splitlines(keepends=True)
-b = open(sys.argv[2], "rb").read().splitlines(keepends=True)
-c = sys.argv[3].encode()
-assert len(a) == len(b), f"line count {len(b)}, stub CSV has {len(a)}"
-assert all(x.endswith(b"\r\n") for x in a), "stub CSV lines do not all end with CRLF"
-seen, n = False, {"meta": 0, "header": 0, "data": 0}
-for i, (x, y) in enumerate(zip(a, b), 1):
-    if x.startswith(b"<"):
-        exp, k = c + x, "meta"
-    elif x.startswith((b"NO;TIME", b"NO,TIME")):
-        exp, k = (c + x if seen else x), ("header" if seen else "data")
-        seen = True
-    else:
-        exp, k = x, "data"
-    n[k] += 1
-    assert y == exp, f"line {i}: got {y!r}, expected {exp!r}"
-assert n["meta"] >= 6 and n["header"] == 1 and n["data"] >= 4, n
-print("ok", n)
-'
-check_commented() {   # check_commented <stub csv> <published csv> <comment_char>
-  docker run --rm --network none --entrypoint python -v "$DECVOL:/d:ro" -v "$STUBVOL:/stub:ro" "$IMAGE" \
-    -c "$CHECK_COMMENTED" "$@" 2>&1 || fail_t "comment_metadata output is wrong"
-}
-
-# ---- status file and healthcheck -----------------------------------------------------
-# Each status test follows the scraper test whose run it checks and reads the status file
-# that dscrape saved (/stub/status/last.json).
-
-# Fields of the saved status file on one line (also checks the field set and the time
-# formats), then "meta=<uid>:<gid> <mode>" of the status file in the container
+# Fields of the status file on one line (also checks the field set and the time formats)
 ST_SUMMARY='
 import json, re, sys
 st = json.load(open(sys.argv[1]))
@@ -519,574 +426,143 @@ for k in ("started", "finished"):
 assert st["started"] <= st["finished"], (st["started"], st["finished"])
 print(" ".join(k + "=" + json.dumps(st[k], separators=(",", ":")) for k in keys))
 '
-st_summary() {
-  docker run --rm --network none -v "$STUBVOL:/stub:ro" -e ST_SUMMARY="$ST_SUMMARY" --entrypoint sh "$IMAGE" -c \
-    'python -c "$ST_SUMMARY" /stub/status/last.json && echo "meta=$(cat /stub/status/last.meta)"' 2>&1 | tr '\n' ' ' | sed 's/ $//'
-}
-
-# Healthcheck as the scraper user against the saved status file; sets HOUT and HRC.
-#   hc [healthcheck arguments...]   real clock and container start time
-#   hc_rel <now> <started>          --now and --started in minutes after the saved status's
-#                                   "finished" (negative: before)
-hc() {
-  HRC=0
-  HOUT="$(docker run --rm --network none --user "$SU" -v "$STUBVOL:/stub:ro" \
-    -e FLEXGATE_SCRAPER_STATUS_FILE=/stub/status/last.json --entrypoint python "$IMAGE" \
-    /app/healthcheck.py --max-age-minutes 130 "$@" 2>&1)" || HRC=$?
-}
-REL_PY='
-import json, sys
-from datetime import timedelta
-sys.path.insert(0, "/app")
-from healthcheck import format_time, parse_time, status_file_path
-finished = parse_time(json.load(open(status_file_path()))["finished"])
-print(format_time(finished + timedelta(minutes=int(sys.argv[1]))))
-'
-hc_rel() {
-  HRC=0
-  HOUT="$(docker run --rm --network none --user "$SU" -v "$STUBVOL:/stub:ro" -e REL_PY="$REL_PY" \
-    -e FLEXGATE_SCRAPER_STATUS_FILE=/stub/status/last.json --entrypoint sh "$IMAGE" -c '
-      set -e; now="$(python -c "$REL_PY" "$1")"; started="$(python -c "$REL_PY" "$2")"
-      exec python /app/healthcheck.py --max-age-minutes 130 --now "$now" --started "$started"' sh "$1" "$2" 2>&1)" || HRC=$?
-}
-hc_expect() {   # hc_expect <exit code> <text in the output>; after hc or hc_rel (one line)
-  expect "healthcheck exit code ($HOUT)" "$HRC" "$1"
-  contains "healthcheck output" "$HOUT" "$2"
-  expect "healthcheck output lines" "$(printf '%s\n' "$HOUT" | wc -l | tr -d ' ')" "1"
-}
-
-t_status_clean() {
-  expect "status" "$(st_summary)" 'version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=3 files_decoded=2 decode_failed=0 decode_error=null error=null meta=30000:30000 644'
-  expect "status-like files in the downloads volume" "$(vsh 'find /d \( -name "*status*" -o -name "*.json" \) -print')" ""
-  hc
-  hc_expect 0 "healthy: last run "
-  contains "healthcheck output" "$HOUT" ", 1 sources, 3 downloaded, 2 decoded"
-}
-
-t_status_age() {
-  hc_rel 60 -300
-  hc_expect 0 "healthy: last run "
-  hc_rel 190 -300
-  hc_expect 1 "unhealthy: last run finished 190 min ago (max 130)"
-  # restarted 40 min ago, the old status file is still there: grace
-  hc_rel 190 150
-  hc_expect 0 "healthy: last run "
-}
-
-t_status_decode_fail() {
-  expect "status" "$(st_summary)" 'version=1 ok=false sources_ok=2 sources_failed=[] files_downloaded=1 files_decoded=0 decode_failed=1 decode_error=null error=null meta=30000:30000 644'
-  hc
-  hc_expect 1 "unhealthy: 1 decode failure(s) in the last run ("
-}
-
-t_status_no_decoder() {
-  expect "status" "$(st_summary)" 'version=1 ok=false sources_ok=1 sources_failed=[] files_downloaded=1 files_decoded=0 decode_failed=0 decode_error="decoder /opt/nothere/decode3 is missing or not executable" error=null meta=30000:30000 644'
-  hc
-  hc_expect 1 "could not decode: decoder /opt/nothere/decode3 is missing or not executable"
-}
-
-t_status_failed_source() {
-  expect "status" "$(st_summary)" 'version=1 ok=false sources_ok=1 sources_failed=["H0008H"] files_downloaded=2 files_decoded=1 decode_failed=0 decode_error=null error=null meta=30000:30000 644'
-  hc
-  hc_expect 1 "had 1 failed source(s): H0008H"
-  contains "healthcheck output" "$HOUT" "unhealthy: last run 20"
-}
-
-# Without a status file: grace after the container start (overridden); unreadable files
-t_status_none() {
-  local args=(--rm --network none --user "$SU" --entrypoint python "$IMAGE" /app/healthcheck.py --now 2026-11-07T12:00:00Z)
-  HRC=0; HOUT="$(docker run "${args[@]}" --started 2026-11-07T11:00:00Z 2>&1)" || HRC=$?
-  hc_expect 0 "healthy: no run yet, container started 60 min ago (grace 130 min)"
-  HRC=0; HOUT="$(docker run "${args[@]}" --started 2026-11-07T09:50:00Z 2>&1)" || HRC=$?
-  hc_expect 1 "unhealthy: no run since the container started 130 min ago (max 130)"
-  HRC=0; HOUT="$(docker run -e FLEXGATE_SCRAPER_STATUS_FILE=/app/settings.yml "${args[@]}" 2>&1)" || HRC=$?
-  hc_expect 1 "unhealthy: status file unreadable: /app/settings.yml"
-  HRC=0; HOUT="$(docker run -e FLEXGATE_SCRAPER_STATUS_FILE=/app "${args[@]}" 2>&1)" || HRC=$?
-  hc_expect 1 "unhealthy: status file unreadable: /app"
-}
-
-# A run that ends with an unexpected exception (scrape_source replaced by one that raises)
-# still writes the status file, with the error
-RAISING_RUN='
-import json, subprocess, sys
-sys.argv = ["flexgate_scraper.py"]
-sys.path.insert(0, "/app")
-import flexgate_scraper
-def boom(*args):
-    raise RuntimeError("boom")
-flexgate_scraper.scrape_source = boom
-try:
-    flexgate_scraper.main()
-    print("main did not raise")
-except RuntimeError:
-    pass
-st = json.load(open("/var/lib/flexgate_scraper/status.json"))
-print("STATUS", st["ok"], st["error"])
-'
-t_status_exception() {
-  local out
-  out="$(docker run --rm --network none --user "$SU" -e RAISING_RUN="$RAISING_RUN" --entrypoint sh "$IMAGE" -c \
-    'python -c "$RAISING_RUN" && python /app/healthcheck.py; echo "HC $?"' 2>&1)"
-  lacks "output" "$out" "main did not raise"
-  contains "status" "$out" "STATUS False RuntimeError: boom"
-  contains "healthcheck" "$out" "failed: RuntimeError: boom"
-  contains "healthcheck exit code" "$out" "HC 1"
-}
-
-# Entrypoint container with a docker healthcheck: healthy in the grace period (real start
-# time of PID 1), also for docker exec as the scraper user; the settings check at the start
-# writes no status file
-t_status_docker_health() {
-  mkenv health
-  local name health out state
-  name="$(cname)"
-  start_entry "$name" --network none --health-cmd "python /app/healthcheck.py --max-age-minutes 130" \
-    --health-interval 2s --health-retries 1
-  wait_until 40 sh -c "docker inspect -f '{{.State.Health.Status}}' '$name' | grep -qx healthy" || true
-  health="$(docker inspect -f '{{.State.Health.Status}}' "$name")"
-  out="$(docker inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' "$name")"
-  state="$(docker exec "$name" ls -A /var/lib/flexgate_scraper)"
-  HRC=0; HOUT="$(docker exec -u "$SU" "$name" python /app/healthcheck.py 2>&1)" || HRC=$?
-  docker rm -f "$name" >/dev/null
-  expect "health status" "$health" "healthy"
-  contains "health log" "$out" "healthy: no run yet, container started 0 min ago (grace 130 min)"
-  expect "/var/lib/flexgate_scraper after the settings check" "$state" ""
-  hc_expect 0 "healthy: no run yet, container started 0 min ago"
-}
-
-t_dec_absent() {
-  local l
-  l="$(listing "$DL_E/downloads")"
-  lacks "downloaded entries" "$l" "decoded"
-  lacks "downloaded entries" "$l" ".csv"
-}
-
-t_dec_first() {
-  dscrape "$DS/s1.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "decoder calls" "$DCALLS" "$(printf '%s\n' C0003C_P1.f2p C0003C_001.f2b C0003C_002.f2b)"
-  contains "log" "$SOUT" "Decoding C0003C_SITE-03: 2 decoded, 0 failed"
-  lacks "log" "$SOUT" "ERROR"
-  expect "logger folder" "$(dlisting C0003C_SITE-03)" "$(printf '%s\n' \
-    'd raw' 'f raw/C0003C_001.f2b' 'f raw/C0003C_002.f2b' 'd par' 'f par/C0003C_P1.f2p' \
-    'd decoded' 'f decoded/C0003C_001.csv' 'f decoded/C0003C_002.csv' | sorted)"
-}
-
-t_dec_header() {
-  local csv
-  csv="$(vsh 'cat /d/C0003C_SITE-03/decoded/C0003C_001.csv')"
-  contains "decoded/C0003C_001.csv" "$csv" "$(printf 'C0003C_P1.f2p>\r\nNO;TIME;#1(oC);#2(oC);HK-BAT(V)\r\n%%<READOUT>\r\n')"
-  lacks "decoded/C0003C_001.csv" "$csv" "unk."
-  lacks "decoded/C0003C_001.csv" "$csv" "<ERROR"
-}
-
-t_dec_mode() {
-  expect "modes" "$(vsh 'stat -c "%a %n" /d/C0003C_SITE-03/decoded/*')" "$(printf '%s\n' \
-    '644 /d/C0003C_SITE-03/decoded/C0003C_001.csv' '644 /d/C0003C_SITE-03/decoded/C0003C_002.csv')"
-  expect "temporary files" "$(vsh 'find /d -name "*.tmp"')" ""
-}
-
-t_dec_comment_pct() {
-  local expected
-  expected="$(printf "2;28.10.2026 17:00:10;-10,92;-9,3\r\n%%<READOUT>\r\n%%<HK-INFO: 'Server Timeout'>\r\n%%NO;TIME;")"
-  check_commented /stub/keep/C0003C_001.csv /d/C0003C_SITE-03/decoded/C0003C_001.csv %
-  contains "decoded/C0003C_001.csv" "$(vsh 'cat /d/C0003C_SITE-03/decoded/C0003C_001.csv')" "$expected"
-}
-
-t_dec_second() {
-  local before
-  before="$(dlisting C0003C_SITE-03)"
-  dscrape "$DS/s1.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "decoder calls" "$DCALLS" ""
-  lacks "log" "$SOUT" "Decoding"
-  expect "logger folder" "$(dlisting C0003C_SITE-03)" "$before"
-}
-
-t_dec_missing_par() {
-  dscrape "$DS/s2.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "decoder calls" "$DCALLS" "D0004D_001.f2b"
-  contains "log" "$SOUT" "ERROR - Decoding D0004D/raw/D0004D_001.f2b failed"
-  contains "log" "$SOUT" "PARAMETER SET NOT FOUND"
-  contains "log" "$SOUT" "Decoding D0004D: 0 decoded, 1 failed"
-  expect "logger folder" "$(dlisting D0004D)" "$(printf '%s\n' 'd raw' 'f raw/D0004D_001.f2b' 'd par' | sorted)"
-}
-
-t_dec_par_appears() {
-  printf 'NO;TIME;#1(oC);#2(oC)\n' > "$DL_E/srv/fg2lite/data/D0004D/par/D0004D_P1.f2p"
-  dscrape "$DS/s2.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "decoder calls" "$DCALLS" "$(printf '%s\n' D0004D_P1.f2p D0004D_001.f2b)"
-  contains "log" "$SOUT" "Decoding D0004D: 1 decoded, 0 failed"
-  contains "decoded/D0004D_001.csv" "$(vsh 'cat /d/D0004D/decoded/D0004D_001.csv')" "$(printf 'NO;TIME;#1(oC);#2(oC)\r\n1;')"
-}
-
-t_dec_failures() {
-  dscrape "$DS/s3.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "decoder calls" "$DCALLS" "$(printf '%s\n' E0005E_P1.f2p E0005E_a.f2b E0005E_b.f2b E0005E_c.f2b E0005E_d.f2b)"
-  contains "log" "$SOUT" "ERROR - Decoding E0005E/raw/E0005E_a.f2b failed (retried next run): decoder exit code 255"
-  contains "log" "$SOUT" "ERROR - Decoding E0005E/raw/E0005E_b.f2b failed (retried next run): decoder timed out after 3 s"
-  contains "log" "$SOUT" "ERROR - Decoding E0005E/raw/E0005E_d.f2b failed (retried next run): decoder wrote no"
-  contains "log" "$SOUT" "Decoding E0005E: 1 decoded, 3 failed"
-  expect "published" "$(vsh 'ls -A /d/E0005E/decoded')" "E0005E_c.csv"
-}
-
-t_dec_pp_off() {
-  docker run --rm --network none --entrypoint python -v "$DECVOL:/d:ro" -v "$STUBVOL:/stub:ro" "$IMAGE" -c \
-    'import filecmp, sys; sys.exit(0 if filecmp.cmp(sys.argv[1], sys.argv[2], shallow=False) else 1)' \
-    /stub/keep/E0005E_c.csv /d/E0005E/decoded/E0005E_c.csv || fail_t "published CSV differs from the stub's CSV"
-}
-
-t_dec_comment_hash() {
-  dscrape "$DS/s4.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  contains "log" "$SOUT" "Decoding F0006F: 1 decoded, 0 failed"
-  check_commented /stub/keep/F0006F_001.csv /d/F0006F/decoded/F0006F_001.csv '#'
-}
-
-t_dec_no_decoder() {
-  dscrape "$DS/s5.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "missing decoder errors" "$(printf '%s\n' "$SOUT" | grep -c 'ERROR - Decoder /opt/nothere/decode3 is missing or not executable' || true)" "1"
-  expect "number of downloads" "$(n_downloads "$SOUT")" "1"
-  expect "logger folder" "$(dlisting G0007G)" "$(printf '%s\n' 'd raw' 'f raw/G0007G_001.f2b' 'd par' | sorted)"
-}
-
-# Invalid decoding settings: the scraper exits non-zero with the message and downloads
-# nothing. bad_settings <sed expression applied to s1.yml> <expected message>
-bad_settings() {
-  [ -n "$DS" ] || fail_t "the decode test setup did not run"
-  local f="$DS/bad-$TESTNAME.yml" out rc=0
-  sed "$1" "$DS/s1.yml" > "$f"
-  ! cmp -s "$f" "$DS/s1.yml" || fail_t "the sed expression changed nothing"
-  out="$(docker run --rm --network none --user "$SU" -v "$(hp "$f"):/app/settings.yml:ro" \
-    --entrypoint python "$IMAGE" /app/flexgate_scraper.py 2>&1)" || rc=$?
-  [ "$rc" -ne 0 ] || fail_t "exit code 0, expected non-zero: $out"
-  contains "log" "$out" "Invalid settings in /app/settings.yml, not running"
-  contains "log" "$out" "$2"
-  lacks "log" "$out" "Downloading"
-  lacks "log" "$out" "Traceback"
-}
-
-t_bad_step()   { bad_settings 's/steps: \[comment_metadata\]/steps: [comment_metadata, frobnicate]/' "unknown post-processing step(s) ['frobnicate']"; }
-t_bad_char()   { bad_settings 's/comment_char: "%"/comment_char: "%%"/' "comment_char must be exactly one non-whitespace character, got '%%'"; }
-t_bad_space()  { bad_settings 's/comment_char: "%"/comment_char: " "/' "comment_char must be exactly one non-whitespace character"; }
-t_bad_key()    { bad_settings 's/^  enabled: true/  enabled: true\n  colour: blue/' "decoding.colour"; }
-t_bad_pp_key() { bad_settings 's/^    enabled: true/    enabled: true\n    colour: blue/' "decoding.postprocessing.colour"; }
-
-t_bad_entry() {
-  [ -n "$DS" ] || fail_t "the decode test setup did not run"
-  mkenv bad_entry
-  sed 's/steps: \[comment_metadata\]/steps: [frobnicate]/' "$DS/s1.yml" > "$E/settings.yml"
-  local name out rc=0 changes
-  name="$(cname)"
-  out="$(docker run --network none --name "$name" -v "$(hp "$E/settings.yml"):/app/settings.yml:ro" \
-    -v "$(hp "$E/cron"):/app/cron_jobs:ro" "$IMAGE" 2>&1)" || rc=$?
-  changes="$(docker diff "$name" || true)"
-  docker rm -f "$name" >/dev/null
-  [ "$rc" -ne 0 ] || fail_t "exit code 0, expected non-zero: $out"
-  case "$changes" in *"/etc/cron.d/cron_test"*) fail_t "a cron file was installed" ;; esac
-  contains "log" "$out" "unknown post-processing step(s) ['frobnicate']"
-  contains "log" "$out" "/app/settings.yml is invalid"
-}
-
-# ---- run robustness ------------------------------------------------------------------
-# Failing and stalling sources, partial downloads, file modes and the run lock. Uses the
-# fake FlexGate server (control files .fake_status/.fake_delay, see fake_flexgate.py) and
-# the decode volumes; new serials only, so earlier folders are not touched.
-
-RS=""
-
-# Settings without decoding: rob_cfg <file> <source>...; source is SERIAL or
-# SERIAL:FILE[,FILE...] (each FILE is fetched from the serial page as a listed file; written
-# as the comma-separated string form of "files")
-rob_cfg() {
-  local f="$1" s
-  shift
-  {
-    echo 'flexgate_browse_url: "http://flexgate:8080/fg2lite/sw/browse.php"'
-    echo 'base_download_folder: "/app/downloads"'
-    echo 'downloadable_extensions: [".f2p", ".f2b"]'
-    echo 'sources:'
-    for s in "$@"; do
-      echo "  - serial: \"${s%%:*}\""
-      echo '    folders: [raw, par]'
-      [ "$s" = "${s%%:*}" ] || echo "    files: \"${s#*:}\""
+e2e_setup() {
+  [ "$FG_OK" -eq 1 ] || return 0
+  local f="$T/e2e.yml"
+  printf '%s\n' 'flexgate_browse_url: "http://flexgate:8080/fg2lite/sw/browse.php"' \
+    'base_download_folder: "/app/downloads"' 'downloadable_extensions: [".f2p", ".f2b"]' 'sources:' \
+    '  - serial: "A0001A"' '    logger_name: "SITE-01"' '    folders: [raw, par]' '    files: [log.txt]' \
+    'decoding:' '  enabled: true' '  decoder_path: /home/dockeruser/stub/decode3' '  output_folder: decoded' \
+    '  postprocessing:' '    enabled: true' '    comment_char: "%"' '    steps: [comment_metadata]' > "$f"
+  facts e2e "$(docker run --rm --network "$NET" --name "$PFX-e2e" --user "$SU" -e ST_SUMMARY="$ST_SUMMARY" \
+    -v "$(hp "$f"):/app/settings.yml:ro" -v "$(hp "$TESTS_DIR"):/tests:ro" --entrypoint sh "$IMAGE" -c "$EMIT"'
+    s=/home/dockeruser/stub st=/var/lib/flexgate_scraper/status.json
+    mkdir -p $s && cp /tests/stub_decode3.py $s/decode3 && chmod 0755 $s/decode3
+    umask 077
+    for run in run1 run2; do
+      export STUB_DECODE3_CALLS=$s/calls-$run
+      emit $run python /app/flexgate_scraper.py
+      emit ${run}_calls sh -c "cat $STUB_DECODE3_CALLS 2>/dev/null; true"
+      emit ${run}_files sh -c "cd /app/downloads && find . -mindepth 1 -printf \"%y %U:%G %m %P\n\" | LC_ALL=C sort"
+      emit ${run}_status python -c "$ST_SUMMARY" $st
     done
-  } > "$f"
+    emit csv sh -c "tr -d \"\r\" < /app/downloads/A0001A_SITE-01/decoded/A0001A_001.csv"
+    emit tmpleft sh -c "ls -A /tmp | grep -vx flexgate_scraper.lock"
+    emit state ls -A /var/lib/flexgate_scraper
+    emit stmeta stat -c "%u:%g %a" $st
+    emit hc python /app/healthcheck.py
+  ' 2>&1)" || true
+}
+need_e2e() {
+  [ "$FG_OK" -eq 1 ] || fail_t "the fake FlexGate server did not start"
+  [ -n "${F[e2e.run1.rc]:-}" ] || fail_t "the end-to-end container did not run: ${F[e2e]:-}"
 }
 
-rob_setup() {
-  TESTNAME="robsetup"
-  local d="$DL_E/srv/fg2lite/data" s
-  for s in H0008H I0009I J0010J K0011K L0012L M0013M N0014N O0015O P0016P; do mkdir -p "$d/$s/raw" "$d/$s/par"; done
-  # H0008H: every listing answers HTTP 500. I0009I: every listing stalls for 20 s.
-  printf 'h\n' > "$d/H0008H/raw/H0008H_001.f2b"
-  printf '500\n' > "$d/H0008H/.fake_status"
-  printf 'i\n' > "$d/I0009I/raw/I0009I_001.f2b"
-  printf '20\n' > "$d/I0009I/.fake_delay"
-  # J0010J: good logger with a parameter set and a data file (decoded after H0008H fails)
-  printf 'NO;TIME;#1(oC)\n' > "$d/J0010J/par/J0010J_P1.f2p"
-  printf '%s\n' 'PARSET J0010J_P1.f2p' '1;28.10.2026 16:00:10;-1,5' > "$d/J0010J/raw/J0010J_001.f2b"
-  # K0011K: leftover partial downloads; L0012L, M0013M: plain good loggers
-  printf 'k log\n' > "$d/K0011K/log.txt"
-  printf 'k raw\n' > "$d/K0011K/raw/k1.f2p"
-  printf 'l raw\n' > "$d/L0012L/raw/l1.f2p"
-  printf 'm raw\n' > "$d/M0013M/raw/m1.f2p"
-  # N0014N: owner and modes under umask 077; O0015O: downloaded by the cron job
-  printf 'n log\n' > "$d/N0014N/log.txt"
-  printf 'n raw\n' > "$d/N0014N/raw/n1.f2p"
-  printf 'NO;TIME\n' > "$d/N0014N/par/N0014N_P1.f2p"
-  printf 'o raw\n' > "$d/O0015O/raw/o1.f2p"
-  # P0016P: top-level files that change on the server
-  printf 'p log 1\n' > "$d/P0016P/log.txt"
-  printf 'p state\n' > "$d/P0016P/state.dat"
-  printf 'p raw\n' > "$d/P0016P/raw/p1.f2p"
-
-  RS="$DL_E/rob"
-  mkdir -p "$RS"
-  dec_cfg "$RS/r1.yml" /stub/decode3 60 % H0008H J0010J
-  rob_cfg "$RS/r2.yml" I0009I L0012L
-  rob_cfg "$RS/r3.yml" K0011K:log.txt
-  rob_cfg "$RS/r4.yml" M0013M
-  rob_cfg "$RS/r5.yml" N0014N:log.txt
-  rob_cfg "$RS/r6.yml" O0015O
-  rob_cfg "$RS/r7.yml" P0016P:log.txt,state.dat
+t_e2e_first() {
+  need_e2e
+  local log
+  log="${F[e2e.run1.out]:-}"
+  expect "scraper exit code ($log)" "${F[e2e.run1.rc]:-}" "0"
+  contains "log" "$log" "All files downloaded successfully."
+  expect "number of downloads" "$(printf '%s\n' "$log" | grep -c 'Downloading ' || true)" "3"
+  expect "decoder calls" "${F[e2e.run1_calls.out]:-}" "$(printf '%s\n' A0001A_P1.f2p A0001A_001.f2b)"
+  contains "log" "$log" "Decoding A0001A_SITE-01: 1 decoded, 0 failed"
+  lacks "log" "$log" "ERROR"
+  contains "decoded CSV (CRs removed)" "${F[e2e.csv.out]:-}" "$(printf 'NO;TIME;#1(oC);#2(oC)\n%%<READOUT>\n1;')"
+  expect "work folder left in /tmp" "${F[e2e.tmpleft.out]:-}" ""
 }
 
-t_rob_http500() {
-  dscrape "$RS/r1.yml"
-  expect "scraper exit code" "$SRC" "1"
-  contains "log" "$SOUT" "ERROR - Source H0008H failed, continuing with the next source: HTTPError: 500"
-  expect "H0008H files" "$(vsh 'find /d/H0008H -type f')" ""
-  expect "J0010J downloads" "$(dlisting J0010J)" "$(printf '%s\n' 'd raw' 'f raw/J0010J_001.f2b' 'd par' \
-    'f par/J0010J_P1.f2p' 'd decoded' 'f decoded/J0010J_001.csv' | sorted)"
-  expect "decoder calls" "$DCALLS" "$(printf '%s\n' J0010J_P1.f2p J0010J_001.f2b)"
-  contains "log" "$SOUT" "Decoding J0010J: 1 decoded, 0 failed"
-  contains "log" "$SOUT" "Downloads incomplete: 1 source(s) failed: H0008H"
-  contains "log" "$SOUT" "Run finished: 1 source(s) ok, 1 failed, 2 file(s) downloaded."
-  lacks "log" "$SOUT" "All files downloaded successfully."
+t_e2e_second() {
+  need_e2e
+  local log
+  log="${F[e2e.run2.out]:-}"
+  expect "scraper exit code ($log)" "${F[e2e.run2.rc]:-}" "0"
+  expect "number of downloads" "$(printf '%s\n' "$log" | grep -c 'Downloading ' || true)" "0"
+  expect "decoder calls" "${F[e2e.run2_calls.out]:-}" ""
+  lacks "log" "$log" "Decoding"
+  expect "downloads after the second run" "${F[e2e.run2_files.out]:-}" "${F[e2e.run1_files.out]:-}"
 }
 
-t_rob_stall() {
-  local start=$SECONDS
-  dscrape "$RS/r2.yml" -e FLEXGATE_SCRAPER_TIMEOUT_SECONDS=2
-  expect "scraper exit code" "$SRC" "1"
-  contains "log" "$SOUT" "ERROR - Source I0009I failed, continuing with the next source: ReadTimeout"
-  expect "I0009I files" "$(vsh 'find /d/I0009I -type f')" ""
-  expect "L0012L downloads" "$(dlisting L0012L)" "$(printf '%s\n' 'd raw' 'f raw/l1.f2p' 'd par' | sorted)"
-  contains "log" "$SOUT" "Run finished: 1 source(s) ok, 1 failed, 1 file(s) downloaded."
-  [ $((SECONDS - start)) -lt 15 ] || fail_t "the run waited for the stalled server ($((SECONDS - start)) s)"
+t_e2e_files() {
+  need_e2e
+  expect "downloads (type, owner, mode, path)" "${F[e2e.run1_files.out]:-}" "$(printf '%s\n' \
+    'd 30000:30000 755 A0001A_SITE-01' 'f 30000:30000 644 A0001A_SITE-01/log.txt' \
+    'd 30000:30000 755 A0001A_SITE-01/raw' 'f 30000:30000 644 A0001A_SITE-01/raw/A0001A_001.f2b' \
+    'd 30000:30000 755 A0001A_SITE-01/par' 'f 30000:30000 644 A0001A_SITE-01/par/A0001A_P1.f2p' \
+    'd 30000:30000 755 A0001A_SITE-01/decoded' 'f 30000:30000 644 A0001A_SITE-01/decoded/A0001A_001.csv' | sorted)"
 }
 
-t_rob_bad_timeout() {
-  dscrape "$RS/r4.yml" -e FLEXGATE_SCRAPER_TIMEOUT_SECONDS=soon
-  expect "scraper exit code" "$SRC" "2"
-  contains "log" "$SOUT" "Invalid FLEXGATE_SCRAPER_TIMEOUT_SECONDS='soon'"
-  lacks "log" "$SOUT" "Downloading"
+t_e2e_status() {
+  need_e2e
+  expect "status after the first run" "${F[e2e.run1_status.out]:-}" 'version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=3 files_decoded=1 decode_failed=0 decode_error=null error=null'
+  expect "status after the second run" "${F[e2e.run2_status.out]:-}" 'version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=0 files_decoded=0 decode_failed=0 decode_error=null error=null'
+  expect "status file owner and mode" "${F[e2e.stmeta.out]:-}" "30000:30000 644"
+  expect "/var/lib/flexgate_scraper" "${F[e2e.state.out]:-}" "status.json"
+  expect "healthcheck exit code (${F[e2e.hc.out]:-})" "${F[e2e.hc.rc]:-}" "0"
+  contains "healthcheck" "${F[e2e.hc.out]:-}" "healthy: last run "
 }
 
-t_rob_partial() {
-  [ -n "$RS" ] || fail_t "the robustness setup did not run"
-  vsh 'mkdir -p /d/K0011K/raw && echo partial > /d/K0011K/.log.txt.part && echo partial > /d/K0011K/raw/.k1.f2p.part' \
-    || fail_t "could not create the partial files"
-  dscrape "$RS/r3.yml" -e SCRAPE_UMASK=077
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  contains "log" "$SOUT" "Removing partial download /app/downloads/K0011K/.log.txt.part"
-  contains "log" "$SOUT" "Removing partial download /app/downloads/K0011K/raw/.k1.f2p.part"
-  expect "number of downloads" "$(n_downloads "$SOUT")" "2"
-  expect "K0011K downloads" "$(dlisting K0011K)" "$(printf '%s\n' 'f log.txt' 'd raw' 'f raw/k1.f2p' 'd par' | sorted)"
-  expect "content of log.txt" "$(vsh 'cat /d/K0011K/log.txt')" "k log"
-  expect "content of raw/k1.f2p" "$(vsh 'cat /d/K0011K/raw/k1.f2p')" "k raw"
-  expect ".part files left" "$(vsh 'find /d -name "*.part"')" ""
-}
-
-# Everything the scraper creates belongs to 30000:30000, folders 0755 and files 0644, also
-# when it is started with umask 077
-t_rob_owner() {
-  [ -n "$RS" ] || fail_t "the robustness setup did not run"
-  dscrape "$RS/r5.yml" -e SCRAPE_UMASK=077
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  expect "N0014N entries" "$(vsh 'cd /d && find N0014N -printf "%y %U:%G %m %p\n"' | sorted)" "$(printf '%s\n' \
-    'd 30000:30000 755 N0014N' 'f 30000:30000 644 N0014N/log.txt' 'd 30000:30000 755 N0014N/raw' \
-    'f 30000:30000 644 N0014N/raw/n1.f2p' 'd 30000:30000 755 N0014N/par' 'f 30000:30000 644 N0014N/par/N0014N_P1.f2p' | sorted)"
-}
-
-# Top-level files (P0016P, files log.txt and state.dat): fetched on every run, written only
-# when the content changed, through .part and a rename; an unchanged file keeps its mtime;
-# a failed refresh keeps the old file and fails the source. The tests run in order.
-P_OLD="2020-01-01 00:00:00"
-# "<mtime> <uid>:<gid> <mode> <name>" of the local top-level files, one line each
-ptop() { vsh 'cd /d/P0016P && stat -c "%Y %u:%g %a %n" log.txt state.dat'; }
-ptop_of() { printf '%s\n' "$1" | grep " $2\$"; }
-# Number of requests the fake server got so far for a top-level file of P0016P
-preq() { docker logs "$PFX-fakefg-srv" 2>&1 | grep -c "^REQ /fg2lite/data/P0016P/$1\$" || true; }
-
-t_top_changed() {
-  [ -n "$RS" ] || fail_t "the robustness setup did not run"
-  local before after
-  dscrape "$RS/r7.yml"
-  [ "$SRC" -eq 0 ] || fail_t "first run: scraper exit code $SRC: $SOUT"
-  expect "first run: number of downloads" "$(n_downloads "$SOUT")" "3"
-  vsh "touch -d '$P_OLD' /d/P0016P/log.txt /d/P0016P/state.dat" || fail_t "could not set the mtimes"
-  before="$(ptop)"
-  printf 'p log 2\n' > "$DL_E/srv/fg2lite/data/P0016P/log.txt"
-  dscrape "$RS/r7.yml" -e SCRAPE_UMASK=077
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  after="$(ptop)"
-  expect "number of downloads" "$(n_downloads "$SOUT")" "0"
-  contains "log" "$SOUT" "INFO - Updated /app/downloads/P0016P/log.txt"
-  lacks "log" "$SOUT" "Updated /app/downloads/P0016P/state.dat"
-  contains "log" "$SOUT" "Run finished: 1 source(s) ok, 0 failed, 1 file(s) downloaded."
-  contains "status" "$(st_summary)" " files_downloaded=1 "
-  expect "content of log.txt" "$(vsh 'cat /d/P0016P/log.txt')" "p log 2"
-  expect "content of state.dat" "$(vsh 'cat /d/P0016P/state.dat')" "p state"
-  expect "log.txt owner and mode" "$(ptop_of "$after" log.txt | cut -d' ' -f2-)" "30000:30000 644 log.txt"
-  [ "$(ptop_of "$after" log.txt)" != "$(ptop_of "$before" log.txt)" ] || fail_t "log.txt was not rewritten: $after"
-  expect "state.dat (not rewritten)" "$(ptop_of "$after" state.dat)" "$(ptop_of "$before" state.dat)"
-  expect ".part files left" "$(vsh 'find /d/P0016P -name "*.part"')" ""
-}
-
-t_top_unchanged() {
-  [ -n "$RS" ] || fail_t "the robustness setup did not run"
-  local before after req_log req_state
-  vsh "touch -d '$P_OLD' /d/P0016P/log.txt /d/P0016P/state.dat" || fail_t "could not set the mtimes"
-  before="$(ptop)"
-  req_log="$(preq log.txt)"
-  req_state="$(preq state.dat)"
-  dscrape "$RS/r7.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC: $SOUT"
-  after="$(ptop)"
-  expect "number of downloads" "$(n_downloads "$SOUT")" "0"
-  lacks "log" "$SOUT" "Updated"
-  lacks "log" "$SOUT" "Saved to"
-  contains "log" "$SOUT" "Run finished: 1 source(s) ok, 0 failed, 0 file(s) downloaded."
-  contains "status" "$(st_summary)" " files_downloaded=0 "
-  expect "top-level files (mtime, owner, mode)" "$after" "$before"
-  expect "requests for log.txt" "$(preq log.txt)" "$((req_log + 1))"
-  expect "requests for state.dat" "$(preq state.dat)" "$((req_state + 1))"
-}
-
-t_top_fail() {
-  [ -n "$RS" ] || fail_t "the robustness setup did not run"
-  local d="$DL_E/srv/fg2lite/data/P0016P" before ctl
-  printf 'p log 3\n' > "$d/log.txt"
-  before="$(ptop)"
-  # a file request answered with HTTP 503, then the listing answered with HTTP 500
-  for ctl in .fake_file_status:503 .fake_status:500; do
-    printf '%s\n' "${ctl#*:}" > "$d/${ctl%%:*}"
-    dscrape "$RS/r7.yml"
-    rm -f "$d/${ctl%%:*}"
-    expect "scraper exit code ($ctl)" "$SRC" "1"
-    contains "log ($ctl)" "$SOUT" "ERROR - Source P0016P failed, continuing with the next source: HTTPError: ${ctl#*:}"
-    lacks "log ($ctl)" "$SOUT" "Updated"
-    expect "top-level files ($ctl)" "$(ptop)" "$before"
-    expect "content of log.txt ($ctl)" "$(vsh 'cat /d/P0016P/log.txt')" "p log 2"
-    expect ".part files left ($ctl)" "$(vsh 'find /d/P0016P -name "*.part"')" ""
-  done
-}
-
+# ---- cron job ------------------------------------------------------------------------
 # A cron job line in the production form (user field root, the root shell opens
 # /proc/1/fd/1, the command runs through as-dockeruser) runs as uid 30000 and its output
 # reaches the container log. A line without the privilege drop fails loudly in the log.
-# Waits for the next cron minute, at most about 75 s.
-t_cron_job() {
-  [ -n "$RS" ] || fail_t "the robustness setup did not run"
+# The container starts before all other tests (an early setup) and the test waits for the
+# next cron minute, until at most 130 s after the start.
+
+CRON_NAME="$PFX-cron" CRON_START=0
+cron_setup() {
+  [ "$FG_OK" -eq 1 ] || return 0
   mkenv cron_job
-  cp "$RS/r6.yml" "$E/settings.yml"
+  printf '%s\n' 'flexgate_browse_url: "http://flexgate:8080/fg2lite/sw/browse.php"' \
+    'base_download_folder: "/app/downloads"' 'downloadable_extensions: [".f2p"]' \
+    'sources:' '  - serial: "O0015O"' '    folders: raw' > "$E/settings.yml"
   printf '%s\n' 'SHELL=/bin/sh' \
     '* * * * * root /usr/local/bin/as-dockeruser sh -c '"'"'echo "cron job uid: $(id -u):$(id -g)"; exec /usr/local/bin/python /app/flexgate_scraper.py'"'"' > /proc/1/fd/1 2>&1' \
     '* * * * * root /usr/local/bin/python /app/flexgate_scraper.py --check-settings > /proc/1/fd/1 2>&1' \
     > "$E/cron/cron_test"
-  local name out owner st
-  name="$(cname)"
-  start_entry "$name" --network "$NET" -v "$REPVOL:/app/downloads"
-  wait_until 150 sh -c "docker logs '$name' 2>&1 | grep -q 'Run finished' && docker logs '$name' 2>&1 | grep -q 'Refusing'" || true
-  out="$(docker logs "$name" 2>&1)"
-  owner="$(docker exec "$name" stat -c '%U:%G %a' /app/downloads/O0015O/raw/o1.f2p 2>&1 || true)"
-  st="$(docker exec "$name" stat -c '%U:%G %a' /var/lib/flexgate_scraper/status.json 2>&1 || true)"
-  HRC=0; HOUT="$(docker exec "$name" python /app/healthcheck.py 2>&1)" || HRC=$?
-  docker rm -f "$name" >/dev/null
+  CRON_START=$SECONDS
+  docker run -d --name "$CRON_NAME" --network "$NET" -v "$(hp "$E/settings.yml"):/app/settings.yml:ro" \
+    -v "$(hp "$E/cron"):/app/cron_jobs:ro" "$IMAGE" >/dev/null 2>&1 || true
+}
+
+t_cron_job() {
+  [ "$FG_OK" -eq 1 ] || fail_t "the fake FlexGate server did not start"
+  local out="" owner st hrc=0 hout
+  while [ $((SECONDS - CRON_START)) -lt 130 ]; do
+    out="$(docker logs "$CRON_NAME" 2>&1)" || fail_t "the cron container did not start: $out"
+    case "$out" in *"Run finished"*) case "$out" in *"Refusing"*) break ;; esac ;; esac
+    sleep 1
+  done
+  out="$(docker logs "$CRON_NAME" 2>&1)"
+  owner="$(docker exec "$CRON_NAME" stat -c '%U:%G %a' /app/downloads/O0015O/raw/o1.f2p 2>&1 || true)"
+  st="$(docker exec "$CRON_NAME" stat -c '%U:%G %a' /var/lib/flexgate_scraper/status.json 2>&1 || true)"
+  hout="$(docker exec "$CRON_NAME" python /app/healthcheck.py 2>&1)" || hrc=$?
+  docker rm -f "$CRON_NAME" >/dev/null
+  contains "container log" "$out" "cron.d/ updated"
   expect "status file of the cron run" "$st" "dockeruser:dockeruser 644"
-  hc_expect 0 "healthy: last run "
+  expect "healthcheck exit code ($hout)" "$hrc" "0"
+  contains "healthcheck" "$hout" "healthy: last run "
   contains "container log" "$out" "cron job uid: 30000:30000"
   contains "container log" "$out" "Run finished: 1 source(s) ok, 0 failed, 1 file(s) downloaded."
   contains "container log (line without the privilege drop)" "$out" "ERROR - Refusing to run as root"
   expect "downloaded file" "$owner" "dockeruser:dockeruser 644"
 }
 
-t_rob_mode() {
-  expect "modes" "$(vsh 'stat -c "%a %n" /d/K0011K/log.txt /d/K0011K/raw/k1.f2p /d/L0012L/raw/l1.f2p /d/J0010J/raw/J0010J_001.f2b')" \
-    "$(printf '%s\n' '644 /d/K0011K/log.txt' '644 /d/K0011K/raw/k1.f2p' '644 /d/L0012L/raw/l1.f2p' '644 /d/J0010J/raw/J0010J_001.f2b')"
-}
-
-# A process in the same container holds the lock while the scraper starts
-LOCK_HOLDER='
-import fcntl, os, time
-fd = os.open("/tmp/flexgate_scraper.lock", os.O_RDWR | os.O_CREAT)
-fcntl.flock(fd, fcntl.LOCK_EX)
-open("/tmp/held", "w").close()
-time.sleep(60)
-'
-t_rob_lock() {
-  [ "$DEC_OK" -eq 1 ] || fail_t "the decode test setup failed"
-  local out rc=0
-  out="$(docker run --rm --network "$NET" --name "$(cname)" --user "$SU" \
-    -v "$(hp "$RS/r4.yml"):/app/settings.yml:ro" -v "$DECVOL:/app/downloads" -e LOCK_HOLDER="$LOCK_HOLDER" \
-    --entrypoint sh "$IMAGE" -c 'python -c "$LOCK_HOLDER" & pid=$!; i=0
-      while [ ! -e /tmp/held ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
-      [ -e /tmp/held ] || { echo "lock holder did not start"; exit 9; }
-      python /app/flexgate_scraper.py; rc=$?; kill $pid; exit $rc' 2>&1)" || rc=$?
-  expect "scraper exit code" "$rc" "0"
-  contains "log" "$out" "WARNING - Lock /tmp/flexgate_scraper.lock is held: another run is in progress, skipping this run."
-  lacks "log" "$out" "Downloading"
-  expect "M0013M folder" "$(vsh 'ls -A /d | grep -x M0013M; true')" ""
-  # without the holder the same settings download the file
-  dscrape "$RS/r4.yml"
-  [ "$SRC" -eq 0 ] || fail_t "scraper exit code $SRC without the lock holder: $SOUT"
-  expect "number of downloads" "$(n_downloads "$SOUT")" "1"
-}
-
-# A run skipped because the lock is held leaves the status file alone
-t_status_lock() {
-  [ "$DEC_OK" -eq 1 ] || fail_t "the decode test setup failed"
-  local out rc=0
-  out="$(docker run --rm --network "$NET" --name "$(cname)" --user "$SU" \
-    -v "$(hp "$RS/r4.yml"):/app/settings.yml:ro" -v "$DECVOL:/app/downloads" -e LOCK_HOLDER="$LOCK_HOLDER" \
-    --entrypoint sh "$IMAGE" -c 'python -c "$LOCK_HOLDER" & pid=$!; i=0
-      while [ ! -e /tmp/held ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
-      [ -e /tmp/held ] || { echo "lock holder did not start"; exit 9; }
-      echo earlier > /var/lib/flexgate_scraper/status.json
-      python /app/flexgate_scraper.py; rc=$?; kill $pid
-      echo "STATE $(ls -A /var/lib/flexgate_scraper) $(cat /var/lib/flexgate_scraper/status.json)"; exit $rc' 2>&1)" || rc=$?
-  expect "scraper exit code" "$rc" "0"
-  contains "log" "$out" "another run is in progress, skipping this run."
-  contains "status folder" "$out" "STATE status.json earlier"
-}
-
-# A status file that cannot be written: ERROR in the log, exit code unchanged
-t_status_write_fail() {
-  dscrape "$RS/r4.yml" -e FLEXGATE_SCRAPER_STATUS_FILE=/nonexistent/x/status.json
-  expect "scraper exit code ($SOUT)" "$SRC" "0"
-  contains "log" "$SOUT" "ERROR - Could not write the status file /nonexistent/x/status.json"
-  contains "log" "$SOUT" "Run finished"
-}
-
 # ---- run -----------------------------------------------------------------------------
-# The tests are registered first, then the selected ones run in this order.
+# The tests are registered first, then the selected ones run: the unit tests together in one
+# container, then the container tests in this order.
 #   needs <setup>              the tests registered after it need <setup>_setup ("" for none)
 #   add_test [--slow] <name> <function> [args...]   (--quick skips --slow tests)
 # A setup runs once, just before the first selected test that needs it, after the setups it
-# depends on (setup_deps). Setups that no selected test needs do not run.
+# depends on (setup_deps); an early setup (EARLY_SETUPS) runs before all tests when a selected
+# test needs it. Setups that no selected test needs do not run.
 
 setup_deps() {   # setup_deps <setup>: the setups that must run before it
   case "$1" in
-    dec) echo "fg decsettings" ;;   # server data and settings files
-    rob) echo "fg dec" ;;           # server data; the robustness tests use the decode volumes
+    e2e|cron) echo "fg" ;;
   esac
 }
+EARLY_SETUPS="cron"   # the cron job test waits for the next cron minute: start it first
 
 T_NAMES=() T_CMDS=() T_NEEDS=() T_SLOW=() NEED=""
 needs() { NEED="$1"; }
@@ -1106,75 +582,42 @@ run_setup() {   # run_setup <setup>: once, after its dependencies
 }
 
 needs ""
+while IFS= read -r n; do add_test "$n" UNIT; done < <(unit_names)
 
+needs img
 for c in bash cron python; do add_test "image has $c" t_has "$c"; done
 for c in sudo curl wget git nano unzip rsync; do add_test "image lacks $c" t_lacks "$c"; done
 add_test "image pip check passes" t_pip_check
 add_test "image python packages import" t_python_imports
 add_test "image scripts have valid syntax and the entrypoint is executable" t_syntax
 add_test "image has user dockeruser 30000:30000 owning the data folders, process user root" t_user
+add_test "scraper refuses to run as root, exit 2, nothing written; also --check-settings" t_root_refused
 
+needs entry
 add_test "entrypoint with settings keeps running and installs cron jobs" t_entry_ok
+add_test "entrypoint: docker health of a fresh container is healthy (PID 1 start time)" t_docker_health
+needs refuse
 add_test "entrypoint refuses to start with an empty settings file" t_entry_empty_settings
 add_test "entrypoint refuses to start without a settings file" t_entry_missing_settings
 add_test "entrypoint refuses to start with settings the scraper user cannot read" t_entry_unreadable_settings
+add_test "entrypoint refuses to start with invalid decoding settings" t_entry_bad_decoding
+needs ""
 add_test "entrypoint hands root-owned downloads to dockeruser once, logs the count" t_entry_repair
-add_test "status: healthcheck without a status file: grace after the start, unreadable file" t_status_none
-add_test "status: run ending with an unexpected exception writes ok false with the error" t_status_exception
-add_test "status: docker health of a fresh container is healthy (PID 1 start time)" t_status_docker_health
 
-needs fg
-add_test "scraper refuses to run as root, exit 2, nothing downloaded" t_root_refused
-add_test "scraper downloads listed files and folders into <serial>_<logger_name>/<folder>" t_dl_first
-add_test "scraper second run downloads nothing and logs no skips at INFO" t_dl_second
-add_test "scraper downloads a file that appeared on the server" t_dl_new_file
-add_test "decode: without a decoding block nothing is decoded" t_dec_absent
+needs e2e
+add_test "e2e: first run as dockeruser downloads and decodes (stub decoder), exit 0" t_e2e_first
+add_test "e2e: second run downloads and decodes nothing" t_e2e_second
+add_test "e2e: files 30000:30000 0644, folders 0755, also with umask 077" t_e2e_files
+add_test "e2e: status file 30000:30000 0644 with the run's counts, healthcheck healthy" t_e2e_status
 
-needs dec
-add_test "decode: first run decodes parameter sets first, then each .f2b, adds only decoded/" t_dec_first
-add_test "status: clean run writes status.json, ok true, counts, 30000 0644; healthy" t_status_clean
-add_test "status: unhealthy when the last run is older than the max age, grace after restart" t_status_age
-add_test "decode: CSV has the parameter set's header" t_dec_header
-add_test "decode: published files have mode 0644, no .tmp files left" t_dec_mode
-add_test "decode: comment_metadata with % comments metadata and repeated headers only" t_dec_comment_pct
-add_test "decode: second run calls the decoder for nothing" t_dec_second
-add_test "decode: missing parameter set gives an ERROR and no CSV" t_dec_missing_par
-add_test "status: decode failure gives ok false, decode_failed 1; unhealthy" t_status_decode_fail
-add_test "decode: published after the parameter set appears" t_dec_par_appears
-add_test "decode: exit 255, timeout and no output are ERRORs, other files decoded" t_dec_failures
-add_test "decode: post-processing disabled publishes the decoder output unchanged" t_dec_pp_off
-add_test "decode: comment_metadata with another comment character" t_dec_comment_hash
-add_test "decode: missing decoder gives one ERROR, downloads still happen" t_dec_no_decoder
-add_test "status: missing decoder gives ok false with decode_error; unhealthy" t_status_no_decoder
+needs cron
+add_test --slow "cron job (root, as-dockeruser, > /proc/1/fd/1) runs as 30000, output in the container log" t_cron_job
 
-needs decsettings
-add_test "settings: unknown post-processing step is rejected" t_bad_step
-add_test "settings: two-character comment_char is rejected" t_bad_char
-add_test "settings: whitespace comment_char is rejected" t_bad_space
-add_test "settings: unknown key in decoding is rejected" t_bad_key
-add_test "settings: unknown key in postprocessing is rejected" t_bad_pp_key
-add_test "entrypoint refuses to start with invalid decoding settings" t_bad_entry
-
-needs rob
-add_test "robust: HTTP 500 on one logger, next logger downloaded and decoded, exit 1" t_rob_http500
-add_test "status: failed source gives ok false with its name; unhealthy with the reason" t_status_failed_source
-add_test "robust: stalled server fails only that source after the timeout, exit 1" t_rob_stall
-add_test "robust: invalid timeout override is rejected, nothing downloaded" t_rob_bad_timeout
-add_test "robust: leftover .part files removed and downloaded again, none left" t_rob_partial
-add_test "robust: downloaded files have mode 0644 (also with umask 077)" t_rob_mode
-add_test "robust: second run while the lock is held exits 0 with a WARNING" t_rob_lock
-add_test "status: run skipped by the lock leaves the status file alone" t_status_lock
-add_test "status: unwritable status file logs an ERROR, exit code unchanged" t_status_write_fail
-add_test "user: files 30000:30000 0644, folders 0755, also with umask 077" t_rob_owner
-add_test "top-level files: changed content replaces the file (30000 0644), counted as downloaded" t_top_changed
-add_test "top-level files: unchanged content fetched again, file untouched (mtime), 0 downloaded" t_top_unchanged
-add_test "top-level files: failed refresh (file or listing HTTP error) keeps the old file, exit 1" t_top_fail
-add_test --slow "user: cron job (root, as-dockeruser, > /proc/1/fd/1) runs as 30000, output in the container log" t_cron_job
-
+# Selection: one grep over all names (line numbers of the matching names)
 SELECTED=() SKIPPED=0
+MATCHED=" $(printf '%s\n' "${T_NAMES[@]}" | grep -nE -- "$TEST_FILTER" | cut -d: -f1 | tr '\n' ' ' || true) "
 for i in "${!T_NAMES[@]}"; do
-  if { [ -n "$TEST_FILTER" ] && ! printf '%s\n' "${T_NAMES[i]}" | grep -Eq -- "$TEST_FILTER"; } ||
-     { [ "$QUICK" -eq 1 ] && [ "${T_SLOW[i]}" -eq 1 ]; }; then
+  if [[ "$MATCHED" != *" $((i + 1)) "* ]] || { [ "$QUICK" -eq 1 ] && [ "${T_SLOW[i]}" -eq 1 ]; }; then
     SKIPPED=$((SKIPPED + 1))
   else
     SELECTED+=("$i")
@@ -1182,7 +625,18 @@ for i in "${!T_NAMES[@]}"; do
 done
 [ "${#SELECTED[@]}" -gt 0 ] || { echo "no test selected (TEST_FILTER='$TEST_FILTER', quick=$QUICK)" >&2; exit 2; }
 
+for s in $EARLY_SETUPS; do
+  for i in "${SELECTED[@]}"; do
+    if [ "${T_NEEDS[i]}" = "$s" ]; then run_setup "$s"; break; fi
+  done
+done
+
+UNITS=()
+for i in "${SELECTED[@]}"; do [ "${T_CMDS[i]}" != UNIT ] || UNITS+=("${T_NAMES[i]}"); done
+[ "${#UNITS[@]}" -eq 0 ] || run_unit "${UNITS[@]}"
+
 for i in "${SELECTED[@]}"; do
+  [ "${T_CMDS[i]}" != UNIT ] || continue
   [ -z "${T_NEEDS[i]}" ] || run_setup "${T_NEEDS[i]}"
   read -ra cmd <<< "${T_CMDS[i]}"   # function and arguments; the arguments have no spaces
   run_test "${T_NAMES[i]}" "${cmd[@]}"

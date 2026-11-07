@@ -35,9 +35,13 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 ├── as-dockeruser.sh       # privilege drop to the scraper user (cron jobs, entrypoint)
 ├── entrypoint.sh
 ├── tests/
-│   ├── run.sh
+│   ├── run.sh             # the whole suite: unit tests and container tests
 │   ├── fake_flexgate.py
-│   └── stub_decode3.py
+│   ├── stub_decode3.py
+│   └── unit/              # unit tests (stdlib unittest), run inside the image
+│       ├── run_unit.py
+│       ├── support.py
+│       └── test_*.py
 ├── LICENSE
 ├── .gitattributes
 └── .gitignore
@@ -397,60 +401,81 @@ regenerate the lock as above.
 
 ## Tests
 
-`tests/run.sh <image>` runs behaviour tests against a built image with the docker CLI only
-(bash on Linux or WSL, or Git Bash on Windows with Docker Desktop):
+`tests/run.sh <image>` runs all tests against a built image with the docker CLI only (bash on
+Linux or WSL, or Git Bash on Windows with Docker Desktop):
 
 ```sh
 docker build -t flexgate_scraper:local .
 bash tests/run.sh flexgate_scraper:local
 ```
 
-It covers the image contents (tools present and absent, `pip check`, Python imports, script
-syntax), the entrypoint (cron jobs installed with mode 0644, refusal to start without
-settings) and the scraper itself: it is run against a local fake FlexGate server
-(`tests/fake_flexgate.py`) on a private `--internal` docker network, and the tests check
-where files land, that a second run downloads nothing and that a new file on the server is
-picked up, and that the top-level `files` are fetched every run but replaced only when their
-content changed (an unchanged file keeps its modification time, a failed refresh keeps the
-old file). Run robustness is tested with the fake server's control files (`.fake_status`
-answers a listing with an HTTP error, `.fake_file_status` the files of a directory,
-`.fake_delay` stalls a listing; see `tests/fake_flexgate.py`):
-a failing or stalled logger does not stop the next one and gives exit code 1, leftover
-`.part` files are removed and downloaded again, downloaded files have mode 0644, and a run
-started while the lock is held exits 0 without downloading. The status tests check the
-status file after a clean run, a failed source, a decode failure and a missing decoder
-(fields, owner, mode, nothing in the downloads), that a run skipped by the lock leaves it
-alone, the healthcheck's reasons and its age and grace logic (with the test-only clock
-options), and that a fresh container with a docker healthcheck becomes `healthy`. The decode step is tested with a stub
-decoder (`tests/stub_decode3.py`, which mimics the real decoder's file handling) installed in
-a docker volume: decode once, parameter sets first, missing parameter sets, failures and
-timeouts, post-processing, file modes, nothing written next to the downloaded files, and
-rejected settings. Scraper runs happen as `dockeruser`; the user tests check the user and
-its folders in the image, that a run as root is refused, owners and modes under umask 077,
-the ownership repair at the entrypoint start (once, with the count), and that a cron job line
-in the production form (`root`, `as-dockeruser`, `> /proc/1/fd/1`) runs as uid 30000 with its
-output in the container log, while a line without `as-dockeruser` logs the root refusal
-(this waits for the next cron minute). All other containers run with `--network none`, and all containers, the
-network, the volumes and temporary folders are removed at the end. Each check prints `PASS:` or `FAIL:`, and the
-run ends with `ALL <n> TESTS PASSED` (exit 0) or `<m> OF <n> TESTS FAILED` (exit 1).
+The tests come in two layers:
 
-The full suite takes a few minutes. While working on a change, a part of it can be run:
+- **Unit tests** (`tests/unit/test_*.py`, standard library `unittest`, names
+  `unit: <module>: <description>`) test the scraper's logic in-process: settings validation
+  and the command line, downloads against the fake FlexGate server (`tests/fake_flexgate.py`,
+  started in a thread on 127.0.0.1 for each test) with first and second runs, new files,
+  top-level `files` that are fetched every run but replaced only when their content changed
+  (an unchanged file keeps its modification time, a failed refresh keeps the old file),
+  failing and stalling sources (the fake server's control files: `.fake_status` answers a
+  listing with an HTTP error, `.fake_file_status` the files of a directory, `.fake_delay`
+  stalls a listing), the timeout override, leftover `.part` files, file modes under umask
+  077, the run lock, the status file after clean and failed runs, the healthcheck's reasons,
+  age and grace logic (with an injected clock and start time), and the decode step with a
+  stub decoder (`tests/stub_decode3.py`, which mimics the real decoder's file handling):
+  parameter sets first, decode once, missing parameter sets, failures and timeouts,
+  post-processing, file modes. Each unit test sets up its own temporary folder, server and
+  settings, so they do not depend on each other. All unit tests run in **one** container of
+  the image (`--network none`, as `dockeruser`), through `tests/unit/run_unit.py`, which
+  prints one `PASS:` or `FAIL:` line per unit test.
+- **Container tests** cover what needs a real container: the image contents (tools present
+  and absent, `pip check`, Python imports, script syntax, the user `dockeruser` 30000:30000
+  and its folders, process user root), that a run as root is refused, the entrypoint (cron
+  jobs installed with mode 0644, refusal to start with an empty, missing or unreadable
+  settings file or invalid decoding settings, the ownership repair at the start, once, with
+  the count), one end-to-end path as `dockeruser` with umask 077 against the fake server in
+  its own container on a private `--internal` docker network (first run downloads and
+  decodes with the stub decoder, second run does nothing; owners, modes, status file and
+  healthcheck), the docker healthcheck of a fresh container, and a cron job line in the
+  production form (`root`, `as-dockeruser`, `> /proc/1/fd/1`) that runs as uid 30000 with its
+  output in the container log, while a line without `as-dockeruser` logs the root refusal.
+  Checks that can share a container do; the cron job container starts first, because its
+  test waits for the next cron minute.
+
+Nothing leaves the workstation, and all containers, the network, the volume and the
+temporary folder are removed at the end. Each test prints `PASS:` or `FAIL:`, and the run
+ends with `ALL <n> TESTS PASSED` (exit 0) or `<m> OF <n> TESTS FAILED` (exit 1); `n`
+includes the unit tests. The full suite takes about a minute, much of it the wait
+for the cron minute. While working on a change, a part of it can be run:
 
 ```sh
-TEST_FILTER='^decode:' bash tests/run.sh flexgate_scraper:local   # tests whose name matches
-bash tests/run.sh flexgate_scraper:local --quick                  # skip the slow tests
+TEST_FILTER='^unit:' bash tests/run.sh flexgate_scraper:local            # only the unit tests
+TEST_FILTER='^unit: decoding:' bash tests/run.sh flexgate_scraper:local  # one unit test module
+TEST_FILTER='^entrypoint' bash tests/run.sh flexgate_scraper:local       # tests whose name matches
+bash tests/run.sh flexgate_scraper:local --quick                         # skip the slow tests
 ```
 
 `TEST_FILTER` is an extended regular expression (`grep -E`) matched against the test names as
 printed after `PASS:`; only matching tests run. `--quick` (before or after the image) skips
-the tests marked slow, which wait for the next cron minute or for a timeout. Both can be
-combined. The fake server and the other setups run only when a selected test needs them.
-Tests in a group may rely on what earlier tests of the group left behind, so select a whole
-group (for example `^decode:` or `^top-level files:`) rather than a single later test.
-Skipped tests are counted in a `SKIPPED: <k> test(s)` line before the last line, `n` counts
-only the tests that ran, and a selection without any test is an error (exit 2). The full
-suite, without `TEST_FILTER` and without `--quick`, is what the image build runs, and it must
-pass before a commit.
+the tests marked slow (the cron job test). Both can be combined. The fake server, the shared
+containers and the unit test container run only when a selected test needs them, and every
+test can be selected on its own. Skipped tests are counted in a `SKIPPED: <k> test(s)` line
+before the last line, `n` counts only the tests that ran, and a selection without any test is
+an error (exit 2). The full suite, without `TEST_FILTER` and without `--quick`, is what the
+image build runs, and it must pass before a commit.
+
+A unit test module can also be run directly with `unittest` while iterating (from the
+repository root; under Git Bash, set `MSYS_NO_PATHCONV=1` and write `$(cygpath -m "$PWD")`
+for `$PWD`):
+
+```sh
+docker run --rm --network none --user dockeruser -e PYTHONDONTWRITEBYTECODE=1   -v "$PWD/tests:/tests:ro" -w /tests/unit --entrypoint python flexgate_scraper:local   -m unittest -v test_download       # or test_download.DownloadTest.test_stall
+```
+
+With `-e FLEXGATE_APP_DIR=/appsrc -v "$PWD/app:/appsrc:ro"` added, the unit tests use the
+app code of the checkout instead of the image's, so changes to `app/*.py` can be tested
+without rebuilding the image. A new unit test needs a one-line docstring: it is the test's
+name.
 
 ## Scheduling
 
