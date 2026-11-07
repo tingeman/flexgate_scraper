@@ -1,0 +1,11 @@
+# Direct dependencies of flexgate_scraper.py. requirements.txt is the hash lock generated
+# from this file; edit this file, then regenerate the lock inside the pinned base image
+# (digest from the Dockerfile) from the repository root:
+#
+#   docker run --rm -v "$PWD/app":/w -w /w python:3.13-slim@sha256:<digest from Dockerfile> \
+#     sh -c 'pip install pip-tools && pip-compile --generate-hashes -o requirements.txt requirements.in'
+beautifulsoup4
+pydantic
+pydantic-settings
+PyYAML
+requests

@@ -1,0 +1,6 @@
+# Files used inside the Linux image keep LF line endings in every checkout
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+requirements.* text eol=lf
+config/cron_jobs/* text eol=lf

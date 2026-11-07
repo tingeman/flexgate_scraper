@@ -15,6 +15,7 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 .
 ├── app/
 │   ├── flexgate_scraper.py
+│   ├── requirements.in
 │   ├── requirements.txt
 │   └── settings.yml
 ├── bin/
@@ -26,7 +27,11 @@ A Python-based tool for scraping and downloading data files from the Flexgate se
 ├── docker-compose.yml
 ├── Dockerfile
 ├── entrypoint.sh
+├── tests/
+│   ├── run.sh
+│   └── fake_flexgate.py
 ├── LICENSE
+├── .gitattributes
 └── .gitignore
 ```
 
@@ -103,6 +108,48 @@ docker compose up --build
     ```sh
     python app/flexgate_scraper.py
     ```
+
+## Build
+
+The Dockerfile pins the base image by digest and installs the Python packages from a hash
+lock (`pip install --require-hashes`). The image contains only `bash`, `cron` and Python
+with the packages from the lock.
+
+```sh
+docker build -t flexgate_scraper:local .
+```
+
+To change the Python packages, edit `app/requirements.in` and regenerate the lock
+`app/requirements.txt` inside the pinned base image, so that the hashes match the image's
+Python and platform. From the repository root:
+
+```sh
+docker run --rm -v "$PWD/app":/w -w /w python:3.13-slim@sha256:<digest from Dockerfile> \
+  sh -c 'pip install pip-tools && pip-compile --generate-hashes -o requirements.txt requirements.in'
+```
+
+To update the base image, get the current digest with
+`docker buildx imagetools inspect python:3.13-slim`, put it in the `FROM` line and
+regenerate the lock as above.
+
+## Tests
+
+`tests/run.sh <image>` runs behaviour tests against a built image with the docker CLI only
+(bash on Linux or WSL, or Git Bash on Windows with Docker Desktop):
+
+```sh
+docker build -t flexgate_scraper:local .
+bash tests/run.sh flexgate_scraper:local
+```
+
+It covers the image contents (tools present and absent, `pip check`, Python imports, script
+syntax), the entrypoint (cron jobs installed with mode 0644, refusal to start without
+settings) and the scraper itself: it is run against a local fake FlexGate server
+(`tests/fake_flexgate.py`) on a private `--internal` docker network, and the tests check
+where files land, that a second run downloads nothing and that a new file on the server is
+picked up. All other containers run with `--network none`, and all containers, the network
+and temporary folders are removed at the end. Each check prints `PASS:` or `FAIL:`, and the
+run ends with `ALL <n> TESTS PASSED` (exit 0) or `<m> OF <n> TESTS FAILED` (exit 1).
 
 ## Scheduling
 

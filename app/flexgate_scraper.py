@@ -113,7 +113,7 @@ for source in settings.sources:
                 if file_name in specific_files:
                     file_path = serial_output_folder / file_name
                     if file_path.exists():
-                        logging.info(f"Skipping {file_name}, already downloaded.")
+                        logging.debug(f"Skipping {file_name}, already downloaded.")
                         continue
                     
                     # combine baseurl wiht href
@@ -147,7 +147,7 @@ for source in settings.sources:
 
                 file_path = output_folder / file_name
                 if file_path in existing_files:
-                    logging.info(f"Skipping {file_name}, already downloaded.")
+                    logging.debug(f"Skipping {file_name}, already downloaded.")
                     continue
 
                 # combine baseurl wiht href
