@@ -37,7 +37,7 @@ import healthcheck  # noqa: E402
 # The format of the scraper's log lines without the time (production: "<time> - " first)
 LOG_FORMAT = "%(levelname)s - %(message)s"
 STATUS_KEYS = ["version", "ok", "sources_ok", "sources_failed", "files_downloaded", "files_decoded",
-               "decode_failed", "decode_error", "error"]
+               "decode_failed", "decode_waiting", "decode_skipped", "decode_error", "error"]
 
 
 @contextlib.contextmanager

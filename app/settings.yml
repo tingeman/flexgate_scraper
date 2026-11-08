@@ -54,6 +54,10 @@ sources:
 #   decoder_path: /opt/geoprecision/decode3   # decoder program inside the container
 #   output_folder: decoded                    # subfolder of each logger folder
 #   timeout_seconds: 60                       # per decoder call
+#   missing_parameter_set_days: 7             # a data file whose parameter set is missing is
+#                                             # retried for this many days after its download,
+#                                             # then listed in {output_folder}/skipped.txt and
+#                                             # no longer retried (0: at once)
 #   postprocessing:                           # optional; absent = decoder output unchanged
 #     enabled: true
 #     comment_char: "%"                       # exactly one non-whitespace character

@@ -29,6 +29,34 @@ class HealthcheckTest(ScraperTestCase):
                              "--started", "2026-11-07T07:00:00Z")
         self.assertIn(", 2 sources, 3 downloaded, 1 decoded", out)
 
+    def test_waiting_skipped_healthy(self):
+        """decode_waiting and decode_skipped are reported but never unhealthy"""
+        args = ("--now", "2026-11-07T12:01:00Z", "--started", "2026-11-07T07:00:00Z")
+        self.write_status(decode_waiting=2, decode_skipped=4)
+        out = self.assert_hc(0, "healthy: last run ", *args)
+        self.assertTrue(out.endswith(", 1 decoded, 2 waiting for a parameter set, 4 skipped (parameter set missing)"),
+                        out)
+        self.write_status(decode_waiting=0, decode_skipped=4)
+        out = self.assert_hc(0, "healthy: last run ", *args)
+        self.assertTrue(out.endswith(", 1 decoded, 4 skipped (parameter set missing)"), out)
+        # with a real failure the counts change nothing: unhealthy
+        self.write_status(ok=False, decode_failed=1, decode_waiting=2, decode_skipped=4)
+        self.assert_hc(1, f"unhealthy: 1 decode failure(s) in the last run ({FINISHED})", *args)
+        # values that are not numbers are ignored
+        self.write_status(decode_waiting="many", decode_skipped=None)
+        out = self.assert_hc(0, "healthy: last run ", *args)
+        self.assertTrue(out.endswith(", 1 decoded"), out)
+
+    def test_old_status_file(self):
+        """a status file of an older version without decode_waiting and decode_skipped is read"""
+        args = ("--now", "2026-11-07T12:01:00Z", "--started", "2026-11-07T07:00:00Z")
+        self.write_status()
+        st = json.loads(self.status_path.read_text())
+        self.assertNotIn("decode_waiting", st)
+        self.assertNotIn("decode_skipped", st)
+        out = self.assert_hc(0, "healthy: last run ", *args)
+        self.assertEqual(out, f"healthy: last run {FINISHED}, 2 sources, 3 downloaded, 1 decoded")
+
     def test_age(self):
         """unhealthy when the last run is older than the max age, grace after a restart"""
         self.write_status()

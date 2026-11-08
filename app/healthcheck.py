@@ -4,7 +4,9 @@
 
 Exit 0 (healthy) when the last run finished less than N minutes ago and was ok (no failed
 source, no decode failure, no unexpected error). Otherwise exit 1 (unhealthy). Either way one
-line is printed, which ``docker inspect`` shows as the healthcheck output.
+line is printed, which ``docker inspect`` shows as the healthcheck output. Data files waiting
+for their parameter set and skipped ones (``decode_waiting``, ``decode_skipped``; absent in
+status files of older versions) are only reported, never unhealthy.
 
 Grace after the container start: without a status file, the container is healthy for N
 minutes after it started (the start time of PID 1) and unhealthy after that. A status file
@@ -68,6 +70,14 @@ def minutes(seconds: float) -> int:
     return int(max(seconds, 0) // 60)
 
 
+def count(value) -> int:
+    """A count from the status file; 0 when absent or not a number."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def check(max_age: float, now: datetime, started: datetime, path: str):
     """Returns (healthy, message)."""
     since_start = (now - started).total_seconds()
@@ -108,8 +118,14 @@ def check(max_age: float, now: datetime, started: datetime, path: str):
     if ok is not True:
         return False, f"unhealthy: last run {last} was not ok"
     n_sources = int(st.get("sources_ok") or 0) + len(failed)
-    return True, (f"healthy: last run {last}, {n_sources} sources, {st.get('files_downloaded', 0)} downloaded, "
-                  f"{st.get('files_decoded', 0)} decoded")
+    msg = (f"healthy: last run {last}, {n_sources} sources, {st.get('files_downloaded', 0)} downloaded, "
+           f"{st.get('files_decoded', 0)} decoded")
+    waiting, skipped = count(st.get("decode_waiting")), count(st.get("decode_skipped"))
+    if waiting:
+        msg += f", {waiting} waiting for a parameter set"
+    if skipped:
+        msg += f", {skipped} skipped (parameter set missing)"
+    return True, msg
 
 
 def main(argv=None) -> int:

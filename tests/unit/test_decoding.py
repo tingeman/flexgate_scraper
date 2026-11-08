@@ -109,15 +109,25 @@ class DecodingTest(ScraperTestCase):
         self.use_settings([self.decode_source("D0004D")], decoding=self.decoding_block(self.stub_decoder()))
 
     def test_missing_par(self):
-        """missing parameter set gives an ERROR and no CSV"""
+        """missing parameter set of a new data file: it waits (WARNING, not failed), no CSV; healthy"""
         self.d_logger()
-        rc, log = self.run_main()
-        self.assertEqual(rc, 0, log)
-        self.assertEqual(self.calls(), ["D0004D_001.f2b"])
-        self.assertIn("ERROR - Decoding D0004D/raw/D0004D_001.f2b failed", log)
-        self.assertIn("PARAMETER SET NOT FOUND", log)
-        self.assertIn("Decoding D0004D: 0 decoded, 1 failed", log)
-        self.assertEqual(listing(self.downloads / "D0004D"), sorted(["d raw", "f raw/D0004D_001.f2b", "d par"]))
+        for _ in range(2):
+            rc, log = self.run_main()
+            self.assertEqual(rc, 0, log)
+            self.assertEqual(self.calls(), ["D0004D_001.f2b"])
+            self.assertNotIn("ERROR", log)
+            self.assertEqual(log.count("WARNING - "), 1, log)
+            self.assertIn("WARNING - Decoding D0004D/raw/D0004D_001.f2b: waiting for its parameter set D0004D_P1.f2p "
+                          "(retried every run; skipped from 20", log)
+            self.assertIn(", 7 days after the download)", log)
+            self.assertIn("Decoding D0004D: 0 decoded, 0 failed, 1 waiting for a parameter set, 0 skipped", log)
+            self.assertEqual(listing(self.downloads / "D0004D"), sorted(["d raw", "f raw/D0004D_001.f2b", "d par"]))
+            st = self.status()
+            self.assertEqual((st["ok"], st["decode_failed"], st["decode_waiting"], st["decode_skipped"]),
+                             (True, 0, 1, 0))
+            rc, out = self.healthcheck_now()
+            self.assertEqual(rc, 0, out)
+            self.assertIn(", 1 waiting for a parameter set", out)
 
     def test_par_appears(self):
         """published after the parameter set appears"""

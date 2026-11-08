@@ -419,7 +419,7 @@ ST_SUMMARY='
 import json, re, sys
 st = json.load(open(sys.argv[1]))
 keys = ["version", "ok", "sources_ok", "sources_failed", "files_downloaded", "files_decoded",
-        "decode_failed", "decode_error", "error"]
+        "decode_failed", "decode_waiting", "decode_skipped", "decode_error", "error"]
 assert sorted(st) == sorted(keys + ["started", "finished"]), sorted(st)
 for k in ("started", "finished"):
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", st[k]), (k, st[k])
@@ -494,8 +494,8 @@ t_e2e_files() {
 
 t_e2e_status() {
   need_e2e
-  expect "status after the first run" "${F[e2e.run1_status.out]:-}" 'version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=3 files_decoded=1 decode_failed=0 decode_error=null error=null'
-  expect "status after the second run" "${F[e2e.run2_status.out]:-}" 'version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=0 files_decoded=0 decode_failed=0 decode_error=null error=null'
+  expect "status after the first run" "${F[e2e.run1_status.out]:-}" 'version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=3 files_decoded=1 decode_failed=0 decode_waiting=0 decode_skipped=0 decode_error=null error=null'
+  expect "status after the second run" "${F[e2e.run2_status.out]:-}" 'version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=0 files_decoded=0 decode_failed=0 decode_waiting=0 decode_skipped=0 decode_error=null error=null'
   expect "status file owner and mode" "${F[e2e.stmeta.out]:-}" "30000:30000 644"
   expect "/var/lib/flexgate_scraper" "${F[e2e.state.out]:-}" "status.json"
   expect "healthcheck exit code (${F[e2e.hc.out]:-})" "${F[e2e.hc.rc]:-}" "0"

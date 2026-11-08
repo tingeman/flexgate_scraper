@@ -1,6 +1,7 @@
 """The status file a run writes, and the healthcheck's verdict on it."""
 import fcntl
 import os
+import time
 from unittest import mock
 
 from support import ScraperTestCase, capture_logs, fs, listing
@@ -21,7 +22,8 @@ class StatusTest(ScraperTestCase):
         rc, log = self.run_main(umask=0o077)
         self.assertEqual(rc, 0, log)
         self.assertEqual(self.status_summary(), "version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=3 "
-                         f"files_decoded=2 decode_failed=0 decode_error=null error=null meta={self.own()} 644")
+                         "files_decoded=2 decode_failed=0 decode_waiting=0 decode_skipped=0 decode_error=null "
+                         f"error=null meta={self.own()} 644")
         self.assertEqual([e for e in listing(self.downloads) if "status" in e or e.endswith(".json")], [])
         rc, out = self.healthcheck_now()
         self.assertEqual(rc, 0, out)
@@ -39,8 +41,8 @@ class StatusTest(ScraperTestCase):
         rc, log = self.run_main()
         self.assertEqual(rc, 1, log)
         self.assertEqual(self.status_summary(), 'version=1 ok=false sources_ok=1 sources_failed=["H0008H"] '
-                         'files_downloaded=2 files_decoded=1 decode_failed=0 decode_error=null error=null '
-                         f'meta={self.own()} 644')
+                         'files_downloaded=2 files_decoded=1 decode_failed=0 decode_waiting=0 decode_skipped=0 '
+                         f'decode_error=null error=null meta={self.own()} 644')
         rc, out = self.healthcheck_now()
         self.assertEqual(rc, 1, out)
         self.assertIn("had 1 failed source(s): H0008H", out)
@@ -48,16 +50,44 @@ class StatusTest(ScraperTestCase):
 
     def test_decode_failure(self):
         """decode failure gives ok false, decode_failed 1; unhealthy"""
-        self.server_file("D0004D/raw/D0004D_001.f2b", "PARSET D0004D_P1.f2p\n1;28.10.2026 16:00:10;-1,5;-2,5\n")
+        self.server_file("D0004D/raw/D0004D_001.f2b", "STUB:exit255\nPARSET D0004D_P1.f2p\n1;28.10.2026 16:00:10;-1,5\n")
         self.server_dirs("D0004D/par")
         self.use_settings([self.decode_source("D0004D")], decoding=self.decoding_block(self.stub_decoder()))
         rc, log = self.run_main()
         self.assertEqual(rc, 0, log)
         self.assertEqual(self.status_summary(), "version=1 ok=false sources_ok=1 sources_failed=[] files_downloaded=1 "
-                         f"files_decoded=0 decode_failed=1 decode_error=null error=null meta={self.own()} 644")
+                         "files_decoded=0 decode_failed=1 decode_waiting=0 decode_skipped=0 decode_error=null "
+                         f"error=null meta={self.own()} 644")
         rc, out = self.healthcheck_now()
         self.assertEqual(rc, 1, out)
         self.assertTrue(out.startswith("unhealthy: 1 decode failure(s) in the last run ("), out)
+
+    def test_waiting_and_skipped(self):
+        """waiting and skipped data files are counted, ok true; healthy with the counts"""
+        self.server_file("D0004D/raw/D0004D_001.f2b", "PARSET D0004D_P1.f2p\n1;28.10.2026 16:00:10;-1,5\n")
+        self.server_file("D0004D/raw/D0004D_002.f2b", "PARSET D0004D_P2.f2p\n1;28.10.2026 17:00:10;-1,5\n")
+        self.server_dirs("D0004D/par")
+        self.use_settings([self.decode_source("D0004D")], decoding=self.decoding_block(self.stub_decoder()))
+        # D0004D_001.f2b was downloaded 10 days ago (default: skipped after 7 days)
+        raw = self.downloads / "D0004D/raw"
+        raw.mkdir(parents=True)
+        (raw / "D0004D_001.f2b").write_text("PARSET D0004D_P1.f2p\n1;28.10.2026 16:00:10;-1,5\n")
+        old = time.time() - 10 * 86400
+        os.utime(raw / "D0004D_001.f2b", (old, old))
+        rc, log = self.run_main()
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(self.status_summary(), "version=1 ok=true sources_ok=1 sources_failed=[] files_downloaded=1 "
+                         "files_decoded=0 decode_failed=0 decode_waiting=1 decode_skipped=1 decode_error=null "
+                         f"error=null meta={self.own()} 644")
+        rc, out = self.healthcheck_now()
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out.endswith(", 1 sources, 1 downloaded, 0 decoded, 1 waiting for a parameter set, "
+                                     "1 skipped (parameter set missing)"), out)
+        # next run: the skipped file stays skipped (and counted), the other one still waits
+        rc, log = self.run_main()
+        st = self.status()
+        self.assertEqual((st["ok"], st["decode_waiting"], st["decode_skipped"], st["decode_failed"]),
+                         (True, 1, 1, 0), log)
 
     def test_no_decoder(self):
         """missing decoder gives ok false with decode_error; unhealthy"""
@@ -67,8 +97,8 @@ class StatusTest(ScraperTestCase):
         rc, log = self.run_main()
         self.assertEqual(rc, 0, log)
         self.assertEqual(self.status_summary(), "version=1 ok=false sources_ok=1 sources_failed=[] files_downloaded=1 "
-                         'files_decoded=0 decode_failed=0 decode_error="decoder /opt/nothere/decode3 is missing or '
-                         f'not executable" error=null meta={self.own()} 644')
+                         'files_decoded=0 decode_failed=0 decode_waiting=0 decode_skipped=0 decode_error="decoder '
+                         f'/opt/nothere/decode3 is missing or not executable" error=null meta={self.own()} 644')
         rc, out = self.healthcheck_now()
         self.assertEqual(rc, 1, out)
         self.assertIn("could not decode: decoder /opt/nothere/decode3 is missing or not executable", out)

@@ -148,6 +148,7 @@ decoding:
   decoder_path: /opt/geoprecision/decode3  # the decoder program inside the container
   output_folder: decoded                   # subfolder of each logger folder for the CSV files
   timeout_seconds: 60                      # per decoder call; a timeout counts as a failure
+  missing_parameter_set_days: 7            # retry a file without its parameter set this long
   postprocessing:                          # optional; absent or enabled: false = publish
     enabled: true                          #   the decoder's CSV unchanged
     comment_char: "%"
@@ -160,6 +161,9 @@ decoding:
 - `output_folder` (default `decoded`): a plain folder name, created in each logger folder. It
   must not be `raw`, `par` or one of the source's download folders.
 - `timeout_seconds` (default `60`): the longest a single decoder call may take.
+- `missing_parameter_set_days` (default `7`, a whole number >= 0): how many days after its
+  download a data file whose parameter set is missing is retried before it is skipped; `0`
+  skips it on the first failure. See [Missing parameter sets](#missing-parameter-sets).
 - `postprocessing.enabled` (default `true`), `postprocessing.comment_char` (default `%`,
   exactly one non-whitespace character) and `postprocessing.steps` (list of step names, run
   in list order; see below).
@@ -177,7 +181,10 @@ CSV yet is decoded and published as
 
 (`<serial>/` without a logger name), with the base name of the raw file:
 `raw/D1022D_20261030020139.f2b` becomes `decoded/D1022D_20261030020139.csv`. A file is decoded
-once; to decode it again, delete its CSV.
+once; to decode it again, delete its CSV. Data files given up because their parameter set is
+missing are listed in `<output_folder>/skipped.txt` (see
+[Missing parameter sets](#missing-parameter-sets)); it is not hidden, so it is synced and
+backed up together with the CSV files.
 
 The decoder never runs on the downloaded files. Each run uses a temporary work folder in the
 container with its own decoder INI; the inputs are copied there and the folder is removed at
@@ -204,12 +211,64 @@ listed. A step is a function plus a name in the `STEPS` registry in `app/decodin
 ### Failures and retries
 
 A data file is decoded successfully only if the decoder exits with 0, writes the CSV and the
-CSV has no line starting with `<ERROR:` (for example when the parameter set is missing).
-Anything else, a timeout or a failing post-processing step is logged as an ERROR naming the
-file and the reason; nothing is published for that file and it is tried again in the next
-run. A missing or non-executable decoder gives one ERROR per run; the downloads still happen.
+CSV has no line starting with `<ERROR:`. A missing parameter set is handled separately (see
+below). Anything else, a timeout or a failing post-processing step is logged as an ERROR
+naming the file and the reason; nothing is published for that file and it is tried again in
+the next run, and it counts as a decode failure (unhealthy, see [Healthcheck](#healthcheck)).
+A missing or non-executable decoder gives one ERROR per run; the downloads still happen.
 A decoding failure never stops the downloads or the decoding of other files and loggers. Each
-logger with files to decode gets an INFO line with the number of decoded and failed files.
+logger with files to decode gets an INFO line with the number of decoded and failed files
+(and of waiting and newly skipped files, when there are any).
+
+### Missing parameter sets
+
+A data file can only be decoded with the parameter set (`par/*.f2p`) it names. Sometimes that
+parameter set never arrives: it was not downloaded, and FlexGate keeps files for only about
+three months. The decoder then reports `<ERROR: PARAMETER SET NOT FOUND(...): .../<name>.f2p
+...>`. When that is the **only** error the decoder reports for a file (in the CSV, or in its
+output when there is no CSV or the exit code is not 0), the file is not a decode failure:
+
+- **Waiting**: while the data file is younger than `missing_parameter_set_days` (counted from
+  the modification time of `raw/<stem>.f2b`, i.e. its download), it is retried every run and
+  logged as one WARNING per run naming the missing `.f2p` and when the file will be skipped:
+  `Decoding <logger>/raw/<stem>.f2b: waiting for its parameter set <name>.f2p (retried every
+  run; skipped from <time>, 7 days after the download)`. It counts as `decode_waiting`.
+- **Skipped**: once older, the file is listed in `<output_folder>/skipped.txt` and no longer
+  retried, with one WARNING (`... still missing, given up after 7 days, listed in
+  decoded/skipped.txt`). Every later run logs one INFO line per logger, e.g.
+  `D1022D_QAA2017-03: 4 files skipped (parameter set missing), see decoded/skipped.txt`. The
+  decoder is not called for skipped files (nor at all for a logger whose pending files are all
+  skipped). Skipped files count as `decode_skipped`.
+- **Retry**: a missing parameter set obtained by other means (for example from GeoPrecision
+  or from the logger itself) can be put into the logger's `par/` folder on the host
+  (`<base_download_folder>/<serial>_<logger_name>/par/`): every skipped file whose error names
+  that `.f2p` (same base name, also matched case-insensitively) is retried in the next run,
+  whatever the copied file's modification time. Deleting a file's line from `skipped.txt`
+  also retries it in the next run, and so does any `par/*.f2p` newer (modification time) than
+  its skip time (e.g. a newly downloaded one). If the file decodes, its line is removed; if
+  the parameter set is still missing, it is skipped again at once with a new skip time (one
+  WARNING), so it is not retried in a loop.
+- **Not accepted**: when a file is skipped while the `.f2p` its error names is already in
+  `par/` (the decoder did not accept it, e.g. a damaged file or a name that differs in case),
+  its error gets the suffix ` [present in par/ but not accepted by the decoder]`, with one
+  WARNING. The presence of that `.f2p` then no longer retries it; deleting its line or a
+  newer parameter set still does.
+
+Waiting and skipped files never make the container unhealthy. Every other decoder error
+stays an ERROR as above.
+
+`skipped.txt` is plain text: a few `#` comment lines explaining the file, then one line per
+skipped file with three tab-separated fields, the data file name, the UTC time it was skipped
+(ISO 8601, `2026-11-08T12:20:41Z`) and the decoder's error line:
+
+```
+D1022D_20250928120758.f2b	2026-11-08T12:20:41Z	<ERROR: PARAMETER SET NOT FOUND(1): .../D1022D_20250928120758.f2p (Line 1)>
+```
+
+It is written like the CSV files (hidden temporary file `.skipped.txt.tmp` in the same
+folder, then renamed; mode 0644), only when its entries change, and removed when no file is
+skipped any more. Blank, comment and malformed lines are ignored when it is read; lines of
+data files that have a CSV or are gone from `raw/` are dropped at the next rewrite.
 
 ## Usage
 
@@ -290,6 +349,8 @@ logged as an ERROR and does not change the exit code. Fields:
 | `sources_failed` | list of the failed sources' folder names (`<serial>_<logger_name>` or `<serial>`) |
 | `files_downloaded` | files written in this run: new files, and top-level files replaced because their content changed |
 | `files_decoded`, `decode_failed` | data files decoded / failed in this run (`0` without decoding); a logger whose decoding raised unexpectedly counts as one failure |
+| `decode_waiting` | data files waiting for their missing parameter set in this run (retried next run; not failures) |
+| `decode_skipped` | data files listed in the loggers' `skipped.txt` after this run, summed over the loggers (not failures) |
 | `decode_error` | why the decode step could not run at all (e.g. a missing decoder), else `null` |
 | `error` | an unexpected error that ended the run (`<type>: <message>`), else `null` |
 
@@ -308,6 +369,7 @@ ago and was `ok`; exit 1 (unhealthy) otherwise. It prints one line, which
 
 ```
 healthy: last run 2026-11-07T12:20:41Z, 4 sources, 2 downloaded, 2 decoded
+healthy: last run 2026-11-07T12:20:41Z, 4 sources, 0 downloaded, 0 decoded, 1 waiting for a parameter set, 4 skipped (parameter set missing)
 unhealthy: last run 2026-11-07T12:20:41Z had 1 failed source(s): A0001A_SITE-01
 unhealthy: 3 decode failure(s) in the last run (2026-11-07T12:20:41Z)
 unhealthy: last run finished 190 min ago (max 130)
@@ -319,9 +381,13 @@ unhealthy: status file unreadable: ...
   unhealthy (`no run since the container started ... min ago`). A status file from before
   the start (left by `docker restart`) is not counted as too old during that time either;
   its `ok` still counts. So no `start_period` is needed.
-- **Failures stay visible**: a failed source or a decode failure (for example a missing
-  parameter set, which is retried every run) makes the container unhealthy until a run is
-  clean again.
+- **Failures stay visible**: a failed source or a decode failure (retried every run) makes
+  the container unhealthy until a run is clean again.
+- **Missing parameter sets are not failures**: data files waiting for their parameter set
+  and skipped ones (`decode_waiting`, `decode_skipped`, see
+  [Missing parameter sets](#missing-parameter-sets)) are shown in the healthy message when
+  there are any, but never make the container unhealthy. Status files written by older
+  versions, without these fields, are read as before.
 - With the hourly run at :20, 130 minutes allow one missed or slow run.
 - The script uses only the standard library and runs as any user (Docker runs it as root,
   the image's process user). Test-only options `--now` and `--started` (ISO 8601) replace
@@ -425,8 +491,8 @@ The tests come in two layers:
   077, the run lock, the status file after clean and failed runs, the healthcheck's reasons,
   age and grace logic (with an injected clock and start time), and the decode step with a
   stub decoder (`tests/stub_decode3.py`, which mimics the real decoder's file handling):
-  parameter sets first, decode once, missing parameter sets, failures and timeouts,
-  post-processing, file modes. Each unit test sets up its own temporary folder, server and
+  parameter sets first, decode once, missing parameter sets (waiting, `skipped.txt`, retries),
+  failures and timeouts, post-processing, file modes. Each unit test sets up its own temporary folder, server and
   settings, so they do not depend on each other. All unit tests run in **one** container of
   the image (`--network none`, as `dockeruser`), through `tests/unit/run_unit.py`, which
   prints one `PASS:` or `FAIL:` line per unit test.

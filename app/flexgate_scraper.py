@@ -348,6 +348,9 @@ def main() -> int:
         decoded = totals.decoded if totals else 0
         decode_failed = totals.failed if totals else 0
         decode_error = totals.error if totals else None
+        # waiting for a parameter set / skipped because it is missing: not failures
+        decode_waiting = totals.waiting if totals else 0
+        decode_skipped = totals.skipped if totals else 0
         write_status({
             "version": STATUS_VERSION,
             "started": format_time(started),
@@ -358,6 +361,8 @@ def main() -> int:
             "files_downloaded": downloaded,
             "files_decoded": decoded,
             "decode_failed": decode_failed,
+            "decode_waiting": decode_waiting,
+            "decode_skipped": decode_skipped,
             "decode_error": decode_error,
             "error": error,
         })

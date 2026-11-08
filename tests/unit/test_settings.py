@@ -66,6 +66,23 @@ class SettingsTest(ScraperTestCase):
             d["decoding"]["postprocessing"]["colour"] = "blue"
         self.assert_rejected(change, "decoding.postprocessing.colour")
 
+    def test_missing_parameter_set_days_invalid(self):
+        """missing_parameter_set_days that is negative, fractional, a string or a bool is rejected"""
+        for value in (-1, 1.5, "7", True, None):
+            with self.subTest(value=value):
+                def change(d):
+                    d["decoding"]["missing_parameter_set_days"] = value
+                self.assert_rejected(change, "decoding.missing_parameter_set_days")
+
+    def test_missing_parameter_set_days_valid(self):
+        """missing_parameter_set_days defaults to 7 and accepts 0"""
+        d = self.valid()
+        fs.settings = fs.load_settings(self.write_settings(d))
+        self.assertEqual(fs.settings.decoding.missing_parameter_set_days, 7)
+        d["decoding"]["missing_parameter_set_days"] = 0
+        fs.settings = fs.load_settings(self.write_settings(d))
+        self.assertEqual(fs.settings.decoding.missing_parameter_set_days, 0)
+
     def test_output_folder_is_source_folder(self):
         """decoding output_folder that is a download folder is rejected"""
         def change(d):
